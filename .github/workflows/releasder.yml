@@ -35,14 +35,14 @@ jobs:
         run: |
           # 为不同平台和架构进行构建
           # GOOS 是目标操作系统，GOARCH 是目标架构
-          GOOS=linux GOARCH=amd64 go build -v -o myapp-linux-amd64 .
-          GOOS=darwin GOARCH=amd64 go build -v -o myapp-macos-amd64 .
-          GOOS=windows GOARCH=amd64 go build -v -o myapp-windows-amd64.exe .
+          GOOS=linux GOARCH=amd64 go build -v -o single_dl-linux-amd64 .
+          GOOS=darwin GOARCH=amd64 go build -v -o single_dl-macos-amd64 .
+          GOOS=windows GOARCH=amd64 go build -v -o single_dl-windows-amd64.exe .
           
           # 将二进制文件打包成压缩文件
-          tar -czvf myapp-linux-amd64.tar.gz myapp-linux-amd64
-          tar -czvf myapp-macos-amd64.tar.gz myapp-macos-amd64
-          zip myapp-windows-amd64.zip myapp-windows-amd64.exe
+          tar -czvf single_dl-linux-amd64.tar.gz single_dl-linux-amd64
+          tar -czvf single_dl-macos-amd64.tar.gz single_dl-macos-amd64
+          zip single_dl-windows-amd64.zip single_dl-windows-amd64.exe
 
       # 6. 创建 Release 并上传构建好的文件
       # 使用一个成熟的 action 来简化发布操作
@@ -53,6 +53,6 @@ jobs:
           generate_release_notes: true
           # 将编译好的文件上传到 Release
           files: |
-            myapp-linux-amd64.tar.gz
-            myapp-macos-amd64.tar.gz
-            myapp-windows-amd64.zip
+            single_dl-linux-amd64.tar.gz
+            single_dl-macos-amd64.tar.gz
+            single_dl-windows-amd64.zip
