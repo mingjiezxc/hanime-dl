@@ -36,11 +36,11 @@ google-chrome --remote-debugging-port=9222
 
 ##### 列表
 ```
-/usr/local/bin/hanime-dl  -chromeRemoteURL=http://192.168.188.103:9222/json/version -mode list $1
+/usr/local/bin/hanime-dl  -chromeRemoteURL=http://192.168.188.103:9222/json/version -mode list 105532
 ```
 ##### 单个
 ```
-/usr/local/bin/hanime-dl  -chromeRemoteURL=http://192.168.188.103:9222/json/version -mode single $1
+/usr/local/bin/hanime-dl  -chromeRemoteURL=http://192.168.188.103:9222/json/version -mode single 105532
 ```
 
 
