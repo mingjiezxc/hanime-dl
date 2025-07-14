@@ -2,7 +2,7 @@
 
 name: Go Release Binaries
 
-# 1. 配置触发条件：当创建一个新的 tag (以 v 开头) 时触发
+# 1. 配置触发条件：当创建一个新的 tag (以 v 开头) 时触发 
 on:
   push:
     tags:
