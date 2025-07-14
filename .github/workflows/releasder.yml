@@ -1,0 +1,54 @@
+# .github/workflows/release.yml
+
+name: Go Release Binaries
+
+# 1. 配置触发条件：当创建一个新的 tag (以 v 开头) 时触发
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Build and Release Go Binaries
+    # 2. 使用最新的 ubuntu 系统作为构建环境
+    runs-on: ubuntu-latest
+    steps:
+      # 3. 检出你的代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 4. 设置 Go 环境
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # 从 go.mod 文件中读取 Go 版本
+          go-version-file: 'go.mod'
+
+      # 5. 运行跨平台编译和打包
+      # 这里我们直接在 workflow 中编写脚本，也可以调用一个你仓库中的 .sh 文件
+      - name: Build
+        run: |
+          # 为不同平台和架构进行构建
+          # GOOS 是目标操作系统，GOARCH 是目标架构
+          GOOS=linux GOARCH=amd64 go build -v -o myapp-linux-amd64 .
+          GOOS=darwin GOARCH=amd64 go build -v -o myapp-macos-amd64 .
+          GOOS=windows GOARCH=amd64 go build -v -o myapp-windows-amd64.exe .
+          
+          # 将二进制文件打包成压缩文件
+          tar -czvf myapp-linux-amd64.tar.gz myapp-linux-amd64
+          tar -czvf myapp-macos-amd64.tar.gz myapp-macos-amd64
+          zip myapp-windows-amd64.zip myapp-windows-amd64.exe
+
+      # 6. 创建 Release 并上传构建好的文件
+      # 使用一个成熟的 action 来简化发布操作
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          # 自动生成 Release Notes
+          generate_release_notes: true
+          # 将编译好的文件上传到 Release
+          files: |
+            myapp-linux-amd64.tar.gz
+            myapp-macos-amd64.tar.gz
+            myapp-windows-amd64.zip
