@@ -13,6 +13,10 @@ jobs:
     name: Build and Release Go Binaries
     # 2. 使用最新的 ubuntu 系统作为构建环境
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
     steps:
       # 3. 检出你的代码
       - name: Checkout code

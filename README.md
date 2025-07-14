@@ -1,5 +1,4 @@
 ## hanime1.me 下载工具
-
 1. 因 Cloudflare 验证，好多工具都无法下载。
 2. 使用 chrome dev 进行人工跳过验证，基本一开始需要验证。
 3. 访问 hanime1.me 需要配置代理（请手动修改  ubuntu-desktop 的 docker-compose.yaml)
