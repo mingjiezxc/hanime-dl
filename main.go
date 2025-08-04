@@ -348,8 +348,8 @@ func DownloadFile(url, filePath string) error {
 	// Create a transport with proxy explicitly set to nil
 	tr := &http.Transport{
 		// use env proxy
-		// Proxy: http.ProxyFromEnvironment,
-		Proxy: nil,
+		Proxy: http.ProxyFromEnvironment,
+		// Proxy: nil,
 	}
 	// Create a client with the custom transport and a timeout
 	client := http.Client{
