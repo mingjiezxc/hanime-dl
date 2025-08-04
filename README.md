@@ -7,7 +7,7 @@
 ## 使用
 
 ### cp bin
-```
+```bash
 chmod +x hanime-dl 
 cp hanime-dl /usr/local/bin/
 ```
@@ -15,11 +15,12 @@ cp hanime-dl /usr/local/bin/
 这里不一定使用项目内的 docker，你本地运行也是可以的。
 
 ##### docker-compose 启动 chrome
+```bash
 cd ubuntu-desktop
 docker compose up -d
-
-##### 本地 chrome
 ```
+##### 本地 chrome
+```bash
 google-chrome --remote-debugging-port=9222
 ```
 
