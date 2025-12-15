@@ -1,0 +1,10 @@
+#chromeRemoteURL: http://localhost:9222/json/version
+chromeRemoteURL: http://192.168.188.103:9222/json/version
+CacheDir: ./cache
+DownDir: ./downloads
+HttpProxy: http://192.168.188.1:3128
+MaxDownloadWorkers: 2
+ListCode: 
+
+SingleCode: 
+  - 143648

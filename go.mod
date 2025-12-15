@@ -2,7 +2,10 @@ module hanime-dl
 
 go 1.24.0
 
-require github.com/chromedp/chromedp v0.13.6
+require (
+	github.com/chromedp/chromedp v0.13.6
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/chromedp/cdproto v0.0.0-20250403032234-65de8f5d025b // indirect
