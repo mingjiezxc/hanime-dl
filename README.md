@@ -23,7 +23,8 @@
 ```bash
 cd ubuntu-desktop
 docker compose up -d
-# 访问 http://localhost:6080 (或其他配置端口) 并手动完成 Cloudflare 验证
+# 访问 http://localhost:80 (或其他配置端口) 并手动完成 Cloudflare 验证
+# user: root , password: Password
 ```
 
 **选项 B: 本地 Chrome**

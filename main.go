@@ -39,6 +39,7 @@ type Config struct {
 	MaxDownloadWorkers int      `yaml:"MaxDownloadWorkers"`
 	ListCode           []string `yaml:"ListCode"`
 	SingleCode         []string `yaml:"SingleCode"`
+	ClearCache         bool     `yaml:"ClearCache"`
 }
 
 type Result struct {
@@ -77,6 +78,9 @@ func (pw *ProgressWriter) Write(p []byte) (int, error) {
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
+
+	// Default configuration
+	globalConfig.ClearCache = true
 
 	// Load configuration
 	if err := loadConfig(*configPath); err != nil {
@@ -144,6 +148,24 @@ func main() {
 						log.Printf("[Worker %d] Video exists: %s", workerId, meta.VideoFilePath)
 					}
 				}
+
+				// Check download success and clear cache if enabled
+				// We consider success if the Video file exists. Image is secondary.
+				videoSuccess := false
+				if meta.DataURL != "" && meta.VideoFilePath != "" {
+					if _, err := os.Stat(meta.VideoFilePath); err == nil {
+						videoSuccess = true
+					}
+				}
+
+				if videoSuccess && globalConfig.ClearCache {
+					cacheFile := filepath.Join(globalConfig.CacheDir, fmt.Sprintf("info_%s.json", meta.VideoID))
+					if err := os.Remove(cacheFile); err == nil {
+						log.Printf("[Worker %d] Cleared cache for %s (Video downloaded)", workerId, meta.VideoID)
+					} else if !os.IsNotExist(err) {
+						log.Printf("[Worker %d] Failed to clear cache for %s: %v", workerId, meta.VideoID, err)
+					}
+				}
 			}
 		}(i)
 	}
@@ -165,6 +187,16 @@ func main() {
 		list := ChromedpGetList(croUrl, listID)
 		log.Printf("Playlist %s acquired: %d videos found", listID, len(list))
 		allVideoIDs = append(allVideoIDs, list...)
+
+		// Clear list cache if enabled
+		if globalConfig.ClearCache {
+			cacheFile := filepath.Join(globalConfig.CacheDir, fmt.Sprintf("list_%s.json", listID))
+			if err := os.Remove(cacheFile); err == nil {
+				log.Printf("Cleared list cache for %s", listID)
+			} else if !os.IsNotExist(err) {
+				log.Printf("Failed to clear list cache for %s: %v", listID, err)
+			}
+		}
 	}
 
 	// Remove duplicates if needed? For now, we process all.
