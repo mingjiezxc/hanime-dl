@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	maxRetries            = 3
+	maxRetries            = 5
 	retryInterval         = 5 * time.Second
 	hanimeWatchURL        = "https://hanime1.me/watch?v=%s"
 	hanimeDownloadURL     = "https://hanime1.me/download?v=%s"
@@ -42,6 +42,11 @@ type Config struct {
 	ClearCache         bool     `yaml:"ClearCache"`
 }
 
+type VideoTask struct {
+	VideoID string
+	ListID  string
+}
+
 type Result struct {
 	Title    string `json:"title"`
 	ImageURL string `json:"image_url"`
@@ -57,9 +62,22 @@ type VideoMetadata struct {
 	ImageFilePath string `json:"image_file_path"`
 	VideoFilePath string `json:"video_file_path"`
 	TargetDir     string `json:"target_dir"`
+	ListID        string `json:"list_id"`
 }
 
 var globalConfig Config
+
+// ListStatus tracks the progress of a playlist
+type ListStatus struct {
+	Total   int
+	Pending int
+	Mutex   sync.Mutex
+}
+
+var (
+	listProgress = make(map[string]*ListStatus)
+	progressMu   sync.Mutex
+)
 
 // ProgressWriter tracks write progress
 type ProgressWriter struct {
@@ -141,6 +159,8 @@ func main() {
 						log.Printf("[Worker %d] Image exists: %s", workerId, meta.ImageFilePath)
 					}
 				}
+
+				time.Sleep(3 * time.Second)
 				if meta.DataURL != "" && meta.VideoFilePath != "" {
 					if _, err := os.Stat(meta.VideoFilePath); os.IsNotExist(err) {
 						DownloadFileWithRetry(meta.DataURL, meta.VideoFilePath)
@@ -166,48 +186,167 @@ func main() {
 						log.Printf("[Worker %d] Failed to clear cache for %s: %v", workerId, meta.VideoID, err)
 					}
 				}
+
+				// Update List Progress
+				if videoSuccess && meta.ListID != "" {
+					progressMu.Lock()
+					if status, ok := listProgress[meta.ListID]; ok {
+						status.Mutex.Lock()
+						status.Pending--
+						pending := status.Pending
+						status.Mutex.Unlock()
+
+						if pending == 0 && globalConfig.ClearCache {
+							cacheFile := filepath.Join(globalConfig.CacheDir, fmt.Sprintf("list_%s.json", meta.ListID))
+							if err := os.Remove(cacheFile); err == nil {
+								log.Printf("[Worker %d] Cleared list cache for %s (All videos finished)", workerId, meta.ListID)
+							}
+						}
+					}
+					progressMu.Unlock()
+				}
 			}
 		}(i)
 	}
 
-	// Main Thread / Producer Logic
-	// This runs sequentially (or controlled) to resolve links using ChromeDP
+	// Channel for incoming tasks (Discovery -> Resolver)
+	taskQueue := make(chan VideoTask, 1000)
 
-	// 1. Collect all target Video IDs
-	var allVideoIDs []string
+	// Start Discovery Goroutine (Producer 1)
+	go func() {
+		defer close(taskQueue)
 
-	// Add Single Codes
-	for _, id := range globalConfig.SingleCode {
-		allVideoIDs = append(allVideoIDs, id)
-	}
+		// Keep track of tasks to avoid duplicates
+		taskMap := make(map[string]bool)
 
-	// Process Lists to get IDs
-	for _, listID := range globalConfig.ListCode {
-		log.Printf("Fetching playlist for ID: %s", listID)
-		list := ChromedpGetList(croUrl, listID)
-		log.Printf("Playlist %s acquired: %d videos found", listID, len(list))
-		allVideoIDs = append(allVideoIDs, list...)
-
-		// Clear list cache if enabled
-		if globalConfig.ClearCache {
-			cacheFile := filepath.Join(globalConfig.CacheDir, fmt.Sprintf("list_%s.json", listID))
-			if err := os.Remove(cacheFile); err == nil {
-				log.Printf("Cleared list cache for %s", listID)
-			} else if !os.IsNotExist(err) {
-				log.Printf("Failed to clear list cache for %s: %v", listID, err)
+		// Helper to safely add tasks
+		addTask := func(task VideoTask) {
+			if !taskMap[task.VideoID] {
+				taskQueue <- task
+				taskMap[task.VideoID] = true
 			}
 		}
-	}
 
-	// Remove duplicates if needed? For now, we process all.
+		// 1. Single Codes
+		for _, id := range globalConfig.SingleCode {
+			addTask(VideoTask{VideoID: id, ListID: ""})
+		}
 
-	// 2. Resolve Metadata for each ID and push to download queue
-	for _, videoID := range allVideoIDs {
+		// 2. Identify Cached vs Network Lists
+		var cachedLists []string
+		var networkLists []string
+
+		for _, listID := range globalConfig.ListCode {
+			cacheFile := filepath.Join(globalConfig.CacheDir, fmt.Sprintf("list_%s.json", listID))
+			if _, err := os.Stat(cacheFile); err == nil {
+				cachedLists = append(cachedLists, listID)
+			} else {
+				networkLists = append(networkLists, listID)
+			}
+		}
+
+		// Helper to process a list
+		processList := func(listID string) {
+			log.Printf("Fetching playlist for ID: %s", listID)
+			list := ChromedpGetList(croUrl, listID)
+			log.Printf("Playlist %s acquired: %d videos found", listID, len(list))
+
+			// Initialize list progress
+			progressMu.Lock()
+			// Only initialize if not exists (preserve existing progress if resuming?)
+			if _, ok := listProgress[listID]; !ok {
+				listProgress[listID] = &ListStatus{
+					Total:   len(list),
+					Pending: len(list),
+				}
+			}
+			progressMu.Unlock()
+
+			for _, vid := range list {
+				// We construct the task directly here.
+				taskQueue <- VideoTask{VideoID: vid, ListID: listID}
+				taskMap[vid] = true // Mark as seen for "cache scan info" later
+			}
+		}
+
+		// 3. Process Cached Lists (Fast)
+		for _, listID := range cachedLists {
+			processList(listID)
+		}
+
+		// 4. Scan Cache for pending Lists (Resume logic for lists NOT in config)
+		listFiles, _ := filepath.Glob(filepath.Join(globalConfig.CacheDir, "list_*.json"))
+		for _, f := range listFiles {
+			base := filepath.Base(f)
+			if strings.HasPrefix(base, "list_") && strings.HasSuffix(base, ".json") {
+				listID := base[5 : len(base)-5]
+
+				// Check if already processed (is in globalConfig.ListCode)
+				alreadyProcessed := false
+				for _, cfgID := range globalConfig.ListCode {
+					if cfgID == listID {
+						alreadyProcessed = true
+						break
+					}
+				}
+
+				if !alreadyProcessed {
+					log.Printf("Found cached playlist %s, resuming...", listID)
+					processList(listID)
+				}
+			}
+		}
+
+		// 5. Scan Cache for pending Videos (info_*.json)
+		infoFiles, _ := filepath.Glob(filepath.Join(globalConfig.CacheDir, "info_*.json"))
+		for _, f := range infoFiles {
+			base := filepath.Base(f)
+			if strings.HasPrefix(base, "info_") && strings.HasSuffix(base, ".json") {
+				vid := base[5 : len(base)-5]
+				if !taskMap[vid] {
+					log.Printf("Found cached video info for %s, resuming...", vid)
+					addTask(VideoTask{VideoID: vid, ListID: ""})
+				}
+			}
+		}
+
+		// 6. Process Network Lists (Slow)
+		for _, listID := range networkLists {
+			processList(listID)
+		}
+
+		log.Println("Discovery completed, closing task queue.")
+	}()
+
+	// Main Thread / Resolver Logic (Consumer 1 / Producer 2)
+	// Consumes taskQueue, Resolves Info, Produces to downloadQueue
+	for task := range taskQueue {
 		// This block runs in the main thread (sequentially) as requested
 		// "ChromedpGetList, ChromedpDown 为同一线程操作"
-		meta, err := ResolveVideoInfo(croUrl, videoID)
+		meta, err := ResolveVideoInfo(croUrl, task.VideoID, task.ListID)
 		if err != nil {
-			log.Printf("Skipping %s due to resolution failure: %v", videoID, err)
+			log.Printf("Skipping %s due to resolution failure: %v", task.VideoID, err)
+
+			// If resolution fails, we should probably decrement the pending count for the list
+			// because this video will never reach the worker.
+			if task.ListID != "" {
+				progressMu.Lock()
+				if status, ok := listProgress[task.ListID]; ok {
+					status.Mutex.Lock()
+					status.Pending--
+					pending := status.Pending
+					status.Mutex.Unlock()
+
+					// Check if list is complete (even if this one failed)
+					if pending == 0 && globalConfig.ClearCache {
+						cacheFile := filepath.Join(globalConfig.CacheDir, fmt.Sprintf("list_%s.json", task.ListID))
+						if err := os.Remove(cacheFile); err == nil {
+							log.Printf("Cleared list cache for %s (All videos processed/failed)", task.ListID)
+						}
+					}
+				}
+				progressMu.Unlock()
+			}
 			continue
 		}
 
@@ -296,16 +435,15 @@ func ChromedpGetList(croUrl, videoID string) []string {
 
 // ResolveVideoInfo replaces ChromedpDown's logic for fetching metadata.
 // It checks cache first, then uses ChromeDP, then caches result.
-func ResolveVideoInfo(croUrl, videoID string) (VideoMetadata, error) {
+func ResolveVideoInfo(croUrl, videoID, listID string) (VideoMetadata, error) {
 	// Check cache
 	cacheFile := filepath.Join(globalConfig.CacheDir, fmt.Sprintf("info_%s.json", videoID))
 	if data, err := os.ReadFile(cacheFile); err == nil {
 		var cachedMeta VideoMetadata
 		if err := json.Unmarshal(data, &cachedMeta); err == nil {
 			log.Printf("Loaded info for %s from cache", videoID)
-			// Verify if cached paths are still valid relative to current config?
-			// The user requirement says "cache the... target address".
-			// We should respect the cached target dir/paths if we want "continue downloading when restarting".
+			// Update ListID from current context
+			cachedMeta.ListID = listID
 			return cachedMeta, nil
 		}
 	}
@@ -367,6 +505,7 @@ func ResolveVideoInfo(croUrl, videoID string) (VideoMetadata, error) {
 				TargetDir:     fullDir,
 				ImageFilePath: filepath.Join(fullDir, fileNameBase+".jpg"),
 				VideoFilePath: filepath.Join(fullDir, fileNameBase+".mp4"),
+				ListID:        listID,
 			}
 
 			// Save to cache

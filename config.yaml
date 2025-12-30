@@ -5,11 +5,6 @@ DownDir: /mnt/disk3/video/on/
 #HttpProxy: http://192.168.188.1:3128
 MaxDownloadWorkers: 2
 ListCode: 
-  - 166373
-
-  
-
 
 SingleCode: 
-  
 
