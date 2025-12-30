@@ -23,7 +23,7 @@
 ```bash
 cd ubuntu-desktop
 docker compose up -d
-# 访问 http://localhost:80 (或其他配置端口) 并手动完成 Cloudflare 验证
+# 访问 http://localhost:8080 (或其他配置端口) 并手动完成 Cloudflare 验证
 # user: root , password: Password
 ```
 
@@ -133,11 +133,11 @@ MaxDownloadWorkers: 3
 
 # Download from Playlist IDs
 ListCode: 
-  # - 123456
+  - 123456
 
 # Download Single Video IDs
 SingleCode: 
-  # - 654321
+  - 654321
 ```
 
 #### 4. Run
