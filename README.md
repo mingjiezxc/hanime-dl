@@ -60,11 +60,11 @@ MaxDownloadWorkers: 3
 
 # 视频列表下载 (填入视频 ID)
 ListCode: 
-  # - 123456
+  - 123456
 
 # 单个视频下载 (填入视频 ID)
 SingleCode: 
-  # - 654321
+  - 654321
 ```
 
 #### 4. 运行
