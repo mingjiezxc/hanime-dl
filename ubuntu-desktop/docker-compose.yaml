@@ -9,7 +9,7 @@ services:
       # user root
       - HTTP_PASSWORD=Password
       # 配置 可访问 hanime1.me 的 HTTP 代理
-      - PROXY_SERVER="http://192.168.188.1:3128"
+      # - HTTP_PROXY="http://192.168.188.1:3128"
       # - HTTPS_PROXY="http://192.168.188.1:3128"
     volumes:
       - ./chrome.conf:/etc/supervisor/modules-enabled/99-chrome.conf
