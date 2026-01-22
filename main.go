@@ -721,6 +721,8 @@ func DownloadFile(urlStr, filePath string) error {
 		return fmt.Errorf("failed to write to file: %w", err)
 	}
 
+	file.Close()
+
 	log.Printf("[%s] Downloaded %d bytes (Total: %d)", pw.FileName, n, pw.Downloaded)
 
 	if err := os.Rename(tempFilePath, filePath); err != nil {
