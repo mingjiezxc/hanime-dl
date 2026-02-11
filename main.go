@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chromedp/chromedp"
 	"gopkg.in/yaml.v3"
@@ -382,25 +383,32 @@ func ChromedpGetList(croUrl, videoID string) []string {
 		}
 	}
 
-	var links []map[string]string
 	var idList []string
+	var err error
 
 	for i := 0; i < maxRetries; i++ {
-		ctx1, cancel1 := context.WithTimeout(context.Background(), 300*time.Second)
-		defer cancel1()
-		allocatorContext, cancel := chromedp.NewRemoteAllocator(ctx1, croUrl)
-		defer cancel()
+		// Encapsulate attempt in a closure to ensure defers run immediately after attempt
+		idList, err = func() ([]string, error) {
+			ctx1, cancel1 := context.WithTimeout(context.Background(), 300*time.Second)
+			defer cancel1()
+			allocatorContext, cancel := chromedp.NewRemoteAllocator(ctx1, croUrl)
+			defer cancel()
 
-		ctx, cancelCtx := chromedp.NewContext(allocatorContext)
-		defer cancelCtx()
+			ctx, cancelCtx := chromedp.NewContext(allocatorContext)
+			defer cancelCtx()
 
-		err := chromedp.Run(ctx,
-			chromedp.Navigate(fmt.Sprintf(hanimeWatchURL, videoID)),
-			chromedp.Sleep(5*time.Second),
-			chromedp.AttributesAll(playlistSelector, &links, chromedp.ByQueryAll),
-		)
+			var links []map[string]string
+			err := chromedp.Run(ctx,
+				chromedp.Navigate(fmt.Sprintf(hanimeWatchURL, videoID)),
+				chromedp.Sleep(5*time.Second),
+				chromedp.AttributesAll(playlistSelector, &links, chromedp.ByQueryAll),
+			)
 
-		if err == nil {
+			if err != nil {
+				return nil, err
+			}
+
+			var result []string
 			idMap := make(map[string]int)
 			for _, link := range links {
 				if v, ok := link["class"]; ok && v == "overlay" {
@@ -413,14 +421,16 @@ func ChromedpGetList(croUrl, videoID string) []string {
 				}
 			}
 			for k := range idMap {
-				idList = append(idList, k)
+				result = append(result, k)
 			}
+			return result, nil
+		}()
 
+		if err == nil {
 			// Save to cache
 			if cacheData, err := json.Marshal(idList); err == nil {
 				os.WriteFile(cacheFile, cacheData, 0644)
 			}
-
 			return idList
 		}
 
@@ -450,40 +460,61 @@ func ResolveVideoInfo(croUrl, videoID, listID string) (VideoMetadata, error) {
 
 	var res Result
 	var meta VideoMetadata
+	var err error
 
 	for i := 0; i < maxRetries; i++ {
-		ctx1, cancel1 := context.WithTimeout(context.Background(), 3000*time.Second)
-		defer cancel1()
+		// Encapsulate attempt in a closure to ensure defers run immediately after attempt
+		meta, err = func() (VideoMetadata, error) {
+			ctx1, cancel1 := context.WithTimeout(context.Background(), 3000*time.Second)
+			defer cancel1()
 
-		allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, croUrl)
-		defer cancelAllocator()
+			allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, croUrl)
+			defer cancelAllocator()
 
-		ctx, cancelCtx := chromedp.NewContext(allocatorContext)
-		defer cancelCtx()
+			ctx, cancelCtx := chromedp.NewContext(allocatorContext)
+			defer cancelCtx()
 
-		err := chromedp.Run(ctx,
-			chromedp.Navigate(fmt.Sprintf(hanimeDownloadURL, videoID)),
-			chromedp.WaitVisible(downloadTitleSelector, chromedp.ByQuery),
-			chromedp.Sleep(2*time.Second),
-			chromedp.Text(downloadTitleSelector, &res.Title, chromedp.NodeVisible, chromedp.ByQuery),
-			chromedp.AttributeValue(downloadImageSelector, "src", &res.ImageURL, nil, chromedp.ByQuery),
-			chromedp.AttributeValue(downloadLinkSelector, "data-url", &res.DataURL, nil, chromedp.ByQueryAll),
-		)
+			var currentRes Result
+			err := chromedp.Run(ctx,
+				chromedp.Navigate(fmt.Sprintf(hanimeDownloadURL, videoID)),
+				chromedp.WaitVisible(downloadTitleSelector, chromedp.ByQuery),
+				chromedp.Sleep(2*time.Second),
+				chromedp.Text(downloadTitleSelector, &currentRes.Title, chromedp.NodeVisible, chromedp.ByQuery),
+				chromedp.AttributeValue(downloadImageSelector, "src", &currentRes.ImageURL, nil, chromedp.ByQuery),
+				chromedp.AttributeValue(downloadLinkSelector, "data-url", &currentRes.DataURL, nil, chromedp.ByQueryAll),
+			)
 
-		if err == nil {
-			if res.Title == "" || res.DataURL == "" {
-				log.Printf("Failed to extract data (attempt %d/%d) for %s.", i+1, maxRetries, videoID)
-				if i < maxRetries-1 {
-					time.Sleep(retryInterval)
-					continue
-				}
-				return meta, fmt.Errorf("missing title or data url")
+			if err != nil {
+				return VideoMetadata{}, err
 			}
+
+			if currentRes.Title == "" || currentRes.DataURL == "" {
+				return VideoMetadata{}, fmt.Errorf("missing title or data url")
+			}
+
+			// Copy resolved data to local res variable if needed or construct meta directly
+			res = currentRes
 
 			fmt.Printf("Resolved Info for ID %s: %s\n", videoID, res.Title)
 
 			// Sanitize directory name
-			dirName := strings.Split(strings.TrimSpace(res.Title), " ")[0]
+			title := strings.TrimSpace(res.Title)
+			var dirName string
+
+			if strings.HasPrefix(title, "(") {
+				if idx := strings.Index(title, ")"); idx != -1 {
+					dirName = title[:idx+1]
+				}
+			} else if strings.HasPrefix(title, "[") {
+				if idx := strings.Index(title, "]"); idx != -1 {
+					dirName = title[:idx+1]
+				}
+			}
+
+			if dirName == "" {
+				dirName = strings.Split(title, " ")[0]
+			}
+
 			dirName = strings.ReplaceAll(dirName, "/", "_")
 			dirName = strings.ReplaceAll(dirName, "\\", "_")
 
@@ -491,13 +522,14 @@ func ResolveVideoInfo(croUrl, videoID, listID string) (VideoMetadata, error) {
 			fullDir := filepath.Join(globalConfig.DownDir, dirName)
 
 			if errMkdir := os.MkdirAll(fullDir, 0755); errMkdir != nil {
-				return meta, fmt.Errorf("failed to create dir: %w", errMkdir)
+				return VideoMetadata{}, fmt.Errorf("failed to create dir: %w", errMkdir)
 			}
 
 			fileNameBase := strings.ReplaceAll(strings.TrimSpace(res.Title), "/", "_")
 			fileNameBase = strings.ReplaceAll(fileNameBase, "\\", "_")
+			fileNameBase = truncateFilename(fileNameBase, 200)
 
-			meta = VideoMetadata{
+			return VideoMetadata{
 				VideoID:       videoID,
 				Title:         res.Title,
 				ImageURL:      res.ImageURL,
@@ -506,13 +538,14 @@ func ResolveVideoInfo(croUrl, videoID, listID string) (VideoMetadata, error) {
 				ImageFilePath: filepath.Join(fullDir, fileNameBase+".jpg"),
 				VideoFilePath: filepath.Join(fullDir, fileNameBase+".mp4"),
 				ListID:        listID,
-			}
+			}, nil
+		}()
 
+		if err == nil {
 			// Save to cache
 			if cacheData, err := json.MarshalIndent(meta, "", "  "); err == nil {
 				os.WriteFile(cacheFile, cacheData, 0644)
 			}
-
 			return meta, nil
 		}
 
@@ -730,4 +763,20 @@ func DownloadFile(urlStr, filePath string) error {
 	}
 
 	return nil
+}
+
+func truncateFilename(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	s = s[:maxBytes]
+	for len(s) > 0 {
+		r, size := utf8.DecodeLastRuneInString(s)
+		if r == utf8.RuneError && size == 1 {
+			s = s[:len(s)-1]
+		} else {
+			break
+		}
+	}
+	return s
 }

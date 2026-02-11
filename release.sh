@@ -10,7 +10,8 @@
 #   - 使用 gh-cli 创建 GitHub Release 并上传所有打包好的文件
 #
 # 使用方法:
-#   ./release.sh v1.0.0
+#   ./release.sh [v1.2.3]
+#   若未提供版本号，则自动在最新标签上增加 0.0.1（补丁位）
 #
 # =============================================================================
 export http_proxy=http://192.168.188.1:3128
@@ -22,14 +23,22 @@ APP_NAME="hanime-dl"
 RELEASE_DIR="release"
 # ----------------
 
-# 1. 检查是否提供了版本号参数
+# 1. 解析版本号参数（可选），缺省则自动 +0.0.1
 if [ -z "$1" ]; then
-  echo "❌ 错误: 请提供一个版本号作为参数。"
-  echo "   用法: $0 v1.2.3"
-  exit 1
+  last_tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+  if [ -z "$last_tag" ]; then
+    VERSION="v0.0.1"
+  else
+    numver="${last_tag#v}"
+    IFS='.' read -r MAJOR MINOR PATCH <<< "$numver"
+    PATCH=$((PATCH + 1))
+    VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+  fi
+  echo "ℹ️ 未提供版本号，自动计算为: $VERSION"
+else
+  VERSION=$1
 fi
 
-VERSION=$1
 echo "🚀 准备发布版本: $VERSION"
 
 # 2. 检查 gh 命令是否存在
