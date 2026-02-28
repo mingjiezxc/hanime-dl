@@ -43,6 +43,7 @@ The application uses a **Producer-Consumer** pattern:
 | `CacheDir` | `./cache` | Local directory for storing metadata caches (`list_*.json`, `info_*.json`). |
 | `DownDir` | `/mnt/disk3/video/on/` | The ultimate destination directory for downloaded files. |
 | `HttpProxy` | `http://192.168.188.1:3128` | Configured HTTP proxy for downloading media files. |
+| `DirectDownloadFirst` | `false` | If true, attempts direct download first; if failed, retries with `HttpProxy`. |
 | `MaxDownloadWorkers` | `2` | Number of parallel downloads allowed. |
 | `ListCode` | `[158032, 143645, ...]` | List of playlist IDs to process. |
 | `SingleCode` | `[143648]` | List of individual video IDs to process. |

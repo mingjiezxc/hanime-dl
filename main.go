@@ -33,14 +33,15 @@ const (
 )
 
 type Config struct {
-	ChromeRemoteURL    string   `yaml:"chromeRemoteURL"`
-	CacheDir           string   `yaml:"CacheDir"`
-	DownDir            string   `yaml:"DownDir"`
-	HttpProxy          string   `yaml:"HttpProxy"`
-	MaxDownloadWorkers int      `yaml:"MaxDownloadWorkers"`
-	ListCode           []string `yaml:"ListCode"`
-	SingleCode         []string `yaml:"SingleCode"`
-	ClearCache         bool     `yaml:"ClearCache"`
+	ChromeRemoteURL     string   `yaml:"chromeRemoteURL"`
+	CacheDir            string   `yaml:"CacheDir"`
+	DownDir             string   `yaml:"DownDir"`
+	HttpProxy           string   `yaml:"HttpProxy"`
+	DirectDownloadFirst bool     `yaml:"DirectDownloadFirst"`
+	MaxDownloadWorkers  int      `yaml:"MaxDownloadWorkers"`
+	ListCode            []string `yaml:"ListCode"`
+	SingleCode          []string `yaml:"SingleCode"`
+	ClearCache          bool     `yaml:"ClearCache"`
 }
 
 type VideoTask struct {
@@ -614,8 +615,18 @@ func GetWebSocketDebuggerURL(uri string) (string, error) {
 }
 
 func DownloadFileWithRetry(url, filePath string) {
+	if globalConfig.DirectDownloadFirst {
+		log.Printf("Attempting direct download first for %s", url)
+		err := DownloadFile(url, filePath, "")
+		if err == nil {
+			log.Printf("Successfully downloaded %s to %s (Direct)", url, filePath)
+			return
+		}
+		log.Printf("Direct download failed: %v. Switching to proxy...", err)
+	}
+
 	for i := 0; i < maxRetries; i++ {
-		err := DownloadFile(url, filePath)
+		err := DownloadFile(url, filePath, globalConfig.HttpProxy)
 		if err == nil {
 			log.Printf("Successfully downloaded %s to %s", url, filePath)
 			return
@@ -628,7 +639,7 @@ func DownloadFileWithRetry(url, filePath string) {
 	log.Printf("Failed to download %s to %s after %d attempts.", url, filePath, maxRetries)
 }
 
-func DownloadFile(urlStr, filePath string) error {
+func DownloadFile(urlStr, filePath, proxyURL string) error {
 	tempFilePath := filePath + ".tmp"
 	var file *os.File
 	var err error
@@ -661,13 +672,13 @@ func DownloadFile(urlStr, filePath string) error {
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment, // Default
 	}
-	if globalConfig.HttpProxy != "" {
-		proxyUrl, err := url.Parse(globalConfig.HttpProxy)
+	if proxyURL != "" {
+		pUrl, err := url.Parse(proxyURL)
 		if err == nil {
-			tr.Proxy = http.ProxyURL(proxyUrl)
-			log.Printf("Using proxy: %s", globalConfig.HttpProxy)
+			tr.Proxy = http.ProxyURL(pUrl)
+			log.Printf("Using proxy: %s", proxyURL)
 		} else {
-			log.Printf("Invalid proxy URL: %s, ignoring.", globalConfig.HttpProxy)
+			log.Printf("Invalid proxy URL: %s, ignoring.", proxyURL)
 		}
 	}
 

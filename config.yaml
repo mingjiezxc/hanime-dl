@@ -3,8 +3,10 @@ chromeRemoteURL: http://192.168.188.103:9222/json/version
 CacheDir: ./cache
 DownDir: /mnt/disk3/video/on/
 HttpProxy: http://192.168.188.1:3128
+DirectDownloadFirst: true
 MaxDownloadWorkers: 2
-ListCode: 
-  - 166751 
+ListCode: [
+  
+]
 SingleCode: 
 
