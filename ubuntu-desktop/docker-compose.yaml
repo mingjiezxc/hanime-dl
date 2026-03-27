@@ -1,0 +1,24 @@
+services:
+  app:
+    build: .
+    container_name: ubuntu
+    hostname: ubuntu
+    shm_size: 128mb
+    restart: always
+    environment:
+      # user root
+      - HTTP_PASSWORD=Password
+      # 配置 可访问 hanime1.me 的 HTTP 代理
+      # - HTTP_PROXY="http://192.168.188.1:3128"
+      # - HTTPS_PROXY="http://192.168.188.1:3128"
+    volumes:
+      - ./chrome.conf:/etc/supervisor/modules-enabled/99-chrome.conf
+      - ./chrome-stream.conf:/etc/nginx/modules-enabled/99-chrome-stream.conf
+    ports:
+      - 2080:80
+      - 9222:9000
+
+networks:
+  default:
+    external: true
+    name: share
