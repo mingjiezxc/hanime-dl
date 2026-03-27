@@ -15,7 +15,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"gopkg.in/yaml.v3"
 )
@@ -28,18 +30,19 @@ const (
 	playlistSelector      = `#video-playlist-wrapper a`
 	downloadTitleSelector = `h3`
 	downloadImageSelector = `img.download-image`
-	downloadLinkSelector  = `table.download-table tr:nth-child(2) td:nth-child(5) a`
 )
 
 type Config struct {
-	ChromeRemoteURL    string   `yaml:"chromeRemoteURL"`
-	CacheDir           string   `yaml:"CacheDir"`
-	DownDir            string   `yaml:"DownDir"`
-	HttpProxy          string   `yaml:"HttpProxy"`
-	MaxDownloadWorkers int      `yaml:"MaxDownloadWorkers"`
-	ListCode           []string `yaml:"ListCode"`
-	SingleCode         []string `yaml:"SingleCode"`
-	ClearCache         bool     `yaml:"ClearCache"`
+	ChromeRemoteURL     string   `yaml:"chromeRemoteURL"`
+	CacheDir            string   `yaml:"CacheDir"`
+	DownDir             string   `yaml:"DownDir"`
+	HttpProxy           string   `yaml:"HttpProxy"`
+	DirectDownloadFirst bool     `yaml:"DirectDownloadFirst"`
+	MaxDownloadWorkers  int      `yaml:"MaxDownloadWorkers"`
+	ListCode            []string `yaml:"ListCode"`
+	SingleCode          []string `yaml:"SingleCode"`
+	ClearCache          bool     `yaml:"ClearCache"`
+	VideoResolution     string   `yaml:"VideoResolution"`
 }
 
 type VideoTask struct {
@@ -129,7 +132,9 @@ func main() {
 	var err error
 	for i := 0; i < maxRetries; i++ {
 		croUrl, err = GetWebSocketDebuggerURL(globalConfig.ChromeRemoteURL)
+
 		if err == nil {
+			log.Printf("Successfully got WebSocket debugger URL: %s", croUrl)
 			break
 		}
 		log.Printf("Failed to get WebSocket debugger URL (attempt %d/%d): %v", i+1, maxRetries, err)
@@ -382,25 +387,32 @@ func ChromedpGetList(croUrl, videoID string) []string {
 		}
 	}
 
-	var links []map[string]string
 	var idList []string
+	var err error
 
 	for i := 0; i < maxRetries; i++ {
-		ctx1, cancel1 := context.WithTimeout(context.Background(), 300*time.Second)
-		defer cancel1()
-		allocatorContext, cancel := chromedp.NewRemoteAllocator(ctx1, croUrl)
-		defer cancel()
+		// Encapsulate attempt in a closure to ensure defers run immediately after attempt
+		idList, err = func() ([]string, error) {
+			ctx1, cancel1 := context.WithTimeout(context.Background(), 300*time.Second)
+			defer cancel1()
+			allocatorContext, cancel := chromedp.NewRemoteAllocator(ctx1, croUrl, chromedp.NoModifyURL)
+			defer cancel()
 
-		ctx, cancelCtx := chromedp.NewContext(allocatorContext)
-		defer cancelCtx()
+			ctx, cancelCtx := chromedp.NewContext(allocatorContext)
+			defer cancelCtx()
 
-		err := chromedp.Run(ctx,
-			chromedp.Navigate(fmt.Sprintf(hanimeWatchURL, videoID)),
-			chromedp.Sleep(5*time.Second),
-			chromedp.AttributesAll(playlistSelector, &links, chromedp.ByQueryAll),
-		)
+			var links []map[string]string
+			err := chromedp.Run(ctx,
+				chromedp.Navigate(fmt.Sprintf(hanimeWatchURL, videoID)),
+				chromedp.Sleep(5*time.Second),
+				chromedp.AttributesAll(playlistSelector, &links, chromedp.ByQueryAll),
+			)
 
-		if err == nil {
+			if err != nil {
+				return nil, err
+			}
+
+			var result []string
 			idMap := make(map[string]int)
 			for _, link := range links {
 				if v, ok := link["class"]; ok && v == "overlay" {
@@ -413,14 +425,16 @@ func ChromedpGetList(croUrl, videoID string) []string {
 				}
 			}
 			for k := range idMap {
-				idList = append(idList, k)
+				result = append(result, k)
 			}
+			return result, nil
+		}()
 
+		if err == nil {
 			// Save to cache
 			if cacheData, err := json.Marshal(idList); err == nil {
 				os.WriteFile(cacheFile, cacheData, 0644)
 			}
-
 			return idList
 		}
 
@@ -450,40 +464,142 @@ func ResolveVideoInfo(croUrl, videoID, listID string) (VideoMetadata, error) {
 
 	var res Result
 	var meta VideoMetadata
+	var err error
 
 	for i := 0; i < maxRetries; i++ {
-		ctx1, cancel1 := context.WithTimeout(context.Background(), 3000*time.Second)
-		defer cancel1()
+		// Encapsulate attempt in a closure to ensure defers run immediately after attempt
+		meta, err = func() (VideoMetadata, error) {
+			ctx1, cancel1 := context.WithTimeout(context.Background(), 3000*time.Second)
+			defer cancel1()
 
-		allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, croUrl)
-		defer cancelAllocator()
+			allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, croUrl, chromedp.NoModifyURL)
+			defer cancelAllocator()
 
-		ctx, cancelCtx := chromedp.NewContext(allocatorContext)
-		defer cancelCtx()
+			ctx, cancelCtx := chromedp.NewContext(allocatorContext)
+			defer cancelCtx()
 
-		err := chromedp.Run(ctx,
-			chromedp.Navigate(fmt.Sprintf(hanimeDownloadURL, videoID)),
-			chromedp.WaitVisible(downloadTitleSelector, chromedp.ByQuery),
-			chromedp.Sleep(2*time.Second),
-			chromedp.Text(downloadTitleSelector, &res.Title, chromedp.NodeVisible, chromedp.ByQuery),
-			chromedp.AttributeValue(downloadImageSelector, "src", &res.ImageURL, nil, chromedp.ByQuery),
-			chromedp.AttributeValue(downloadLinkSelector, "data-url", &res.DataURL, nil, chromedp.ByQueryAll),
-		)
+			var currentRes Result
+			var downloadLinks []map[string]string
+			err := chromedp.Run(ctx,
+				chromedp.Navigate(fmt.Sprintf(hanimeDownloadURL, videoID)),
+				chromedp.WaitVisible(downloadTitleSelector, chromedp.ByQuery),
+				chromedp.Sleep(2*time.Second),
+				chromedp.Text(downloadTitleSelector, &currentRes.Title, chromedp.NodeVisible, chromedp.ByQuery),
+				chromedp.AttributeValue(downloadImageSelector, "src", &currentRes.ImageURL, nil, chromedp.ByQuery),
+				chromedp.Evaluate(`
+					Array.from(document.querySelectorAll('table.download-table tr')).slice(1).map(tr => {
+						let resTd = tr.querySelector('td:nth-child(2)');
+						let linkA = tr.querySelector('td:nth-child(5) a');
+						if (resTd && linkA) {
+							return {
+								resolution: resTd.innerText.trim(),
+								url: linkA.getAttribute('data-url')
+							};
+						}
+						return null;
+					}).filter(x => x !== null)
+				`, &downloadLinks),
+			)
 
-		if err == nil {
-			if res.Title == "" || res.DataURL == "" {
-				log.Printf("Failed to extract data (attempt %d/%d) for %s.", i+1, maxRetries, videoID)
-				if i < maxRetries-1 {
-					time.Sleep(retryInterval)
-					continue
-				}
-				return meta, fmt.Errorf("missing title or data url")
+			if err != nil {
+				return VideoMetadata{}, err
 			}
+
+			// Select the appropriate resolution
+			if len(downloadLinks) > 0 {
+				selectedURL := ""
+				// Try to find the configured resolution
+				if globalConfig.VideoResolution != "" {
+					for _, linkInfo := range downloadLinks {
+						if strings.Contains(linkInfo["resolution"], globalConfig.VideoResolution) {
+							selectedURL = linkInfo["url"]
+							log.Printf("Found requested resolution %s for %s", globalConfig.VideoResolution, videoID)
+							break
+						}
+					}
+				}
+				// Fallback to the highest resolution (first in the list)
+				if selectedURL == "" {
+					selectedURL = downloadLinks[0]["url"]
+					if globalConfig.VideoResolution != "" {
+						log.Printf("Requested resolution %s not found for %s, falling back to highest available: %s", globalConfig.VideoResolution, videoID, downloadLinks[0]["resolution"])
+					}
+				}
+				currentRes.DataURL = selectedURL
+			}
+
+			if currentRes.Title == "" || currentRes.DataURL == "" {
+				return VideoMetadata{}, fmt.Errorf("missing title or data url")
+			}
+
+			// Try to get high-res cover image from search page
+			searchURL := fmt.Sprintf("https://hanime1.me/search?query=%s", url.QueryEscape(strings.TrimSpace(currentRes.Title))) + "&type=&genre=%E8%A3%8F%E7%95%AA&sort=&date=&duration="
+			var searchImgUrl string
+			log.Printf("VideoID: %s, Title: %s, searchURL: %s,  ", videoID, currentRes.Title, searchURL)
+
+			searchCtx, searchCancel := context.WithTimeout(ctx, 15*time.Second)
+			defer searchCancel()
+
+			searchErr := chromedp.Run(searchCtx,
+				chromedp.Navigate(searchURL),
+				// sleep for a bit to allow the page to load
+				chromedp.Sleep(2*time.Second),
+				chromedp.Evaluate(fmt.Sprintf(`
+					new Promise((resolve) => {
+						let attempts = 0;
+						let check = () => {
+							attempts++;
+							let link = document.querySelector("a[href*='watch?v=%s']");
+							if (link) {
+								let img = link.querySelector("img");
+								if (img && img.src) {
+									resolve(img.src);
+									return;
+								}
+							}
+							if (attempts >= 25) { // wait up to 5 seconds (25 * 200ms)
+								resolve("");
+								return;
+							}
+							setTimeout(check, 200);
+						};
+						check();
+					});
+				`, videoID), &searchImgUrl, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
+					return p.WithAwaitPromise(true)
+				}),
+			)
+
+			if searchErr == nil && searchImgUrl != "" {
+				currentRes.ImageURL = searchImgUrl
+				log.Printf("Found high-res cover image from search for %s", videoID)
+			} else {
+				log.Printf("Search for high-res cover failed for %s, falling back to download page image", videoID)
+			}
+
+			// Copy resolved data to local res variable if needed or construct meta directly
+			res = currentRes
 
 			fmt.Printf("Resolved Info for ID %s: %s\n", videoID, res.Title)
 
 			// Sanitize directory name
-			dirName := strings.Split(strings.TrimSpace(res.Title), " ")[0]
+			title := strings.TrimSpace(res.Title)
+			var dirName string
+
+			if strings.HasPrefix(title, "(") {
+				if idx := strings.Index(title, ")"); idx != -1 {
+					dirName = title[:idx+1]
+				}
+			} else if strings.HasPrefix(title, "[") {
+				if idx := strings.Index(title, "]"); idx != -1 {
+					dirName = title[:idx+1]
+				}
+			}
+
+			if dirName == "" {
+				dirName = strings.Split(title, " ")[0]
+			}
+
 			dirName = strings.ReplaceAll(dirName, "/", "_")
 			dirName = strings.ReplaceAll(dirName, "\\", "_")
 
@@ -491,13 +607,14 @@ func ResolveVideoInfo(croUrl, videoID, listID string) (VideoMetadata, error) {
 			fullDir := filepath.Join(globalConfig.DownDir, dirName)
 
 			if errMkdir := os.MkdirAll(fullDir, 0755); errMkdir != nil {
-				return meta, fmt.Errorf("failed to create dir: %w", errMkdir)
+				return VideoMetadata{}, fmt.Errorf("failed to create dir: %w", errMkdir)
 			}
 
 			fileNameBase := strings.ReplaceAll(strings.TrimSpace(res.Title), "/", "_")
 			fileNameBase = strings.ReplaceAll(fileNameBase, "\\", "_")
+			fileNameBase = truncateFilename(fileNameBase, 200)
 
-			meta = VideoMetadata{
+			return VideoMetadata{
 				VideoID:       videoID,
 				Title:         res.Title,
 				ImageURL:      res.ImageURL,
@@ -506,13 +623,14 @@ func ResolveVideoInfo(croUrl, videoID, listID string) (VideoMetadata, error) {
 				ImageFilePath: filepath.Join(fullDir, fileNameBase+".jpg"),
 				VideoFilePath: filepath.Join(fullDir, fileNameBase+".mp4"),
 				ListID:        listID,
-			}
+			}, nil
+		}()
 
+		if err == nil {
 			// Save to cache
 			if cacheData, err := json.MarshalIndent(meta, "", "  "); err == nil {
 				os.WriteFile(cacheFile, cacheData, 0644)
 			}
-
 			return meta, nil
 		}
 
@@ -527,6 +645,14 @@ func ResolveVideoInfo(croUrl, videoID, listID string) (VideoMetadata, error) {
 
 func GetWebSocketDebuggerURL(uri string) (string, error) {
 	var lastErr error
+	if strings.HasPrefix(uri, "ws://") || strings.HasPrefix(uri, "wss://") {
+		return uri, nil
+	}
+	parsedURL, parseErr := url.Parse(uri)
+	baseHost := ""
+	if parseErr == nil {
+		baseHost = parsedURL.Host
+	}
 	for i := 0; i < maxRetries; i++ {
 		tr := &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -542,7 +668,7 @@ func GetWebSocketDebuggerURL(uri string) (string, error) {
 			continue
 		}
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "curl/7.81.0")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -559,7 +685,12 @@ func GetWebSocketDebuggerURL(uri string) (string, error) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("server returned non-200 status: %s", resp.Status)
+			bodyText := strings.TrimSpace(string(body))
+			if bodyText == "" {
+				lastErr = fmt.Errorf("server returned non-200 status: %s", resp.Status)
+			} else {
+				lastErr = fmt.Errorf("server returned non-200 status: %s, body: %s", resp.Status, bodyText)
+			}
 			continue
 		}
 
@@ -575,14 +706,42 @@ func GetWebSocketDebuggerURL(uri string) (string, error) {
 			lastErr = fmt.Errorf("WebSocketDebuggerURL is empty")
 			continue
 		}
+		if baseHost != "" {
+			if wsURL, err := url.Parse(WsInfo.WebSocketDebuggerURL); err == nil && wsURL.Host != "" {
+				if strings.HasPrefix(wsURL.Host, "0.0.0.0") || strings.HasPrefix(wsURL.Host, "127.0.0.1") {
+					wsURL.Host = baseHost
+
+					// Append the token from the original URI if it exists
+					if parseErr == nil && parsedURL.RawQuery != "" {
+						if wsURL.RawQuery == "" {
+							wsURL.RawQuery = parsedURL.RawQuery
+						} else {
+							wsURL.RawQuery = wsURL.RawQuery + "&" + parsedURL.RawQuery
+						}
+					}
+
+					return wsURL.String(), nil
+				}
+			}
+		}
 		return WsInfo.WebSocketDebuggerURL, nil
 	}
 	return "", fmt.Errorf("failed after %d attempts, last error: %w", maxRetries, lastErr)
 }
 
 func DownloadFileWithRetry(url, filePath string) {
+	if globalConfig.DirectDownloadFirst {
+		log.Printf("Attempting direct download first for %s", url)
+		err := DownloadFile(url, filePath, "")
+		if err == nil {
+			log.Printf("Successfully downloaded %s to %s (Direct)", url, filePath)
+			return
+		}
+		log.Printf("Direct download failed: %v. Switching to proxy...", err)
+	}
+
 	for i := 0; i < maxRetries; i++ {
-		err := DownloadFile(url, filePath)
+		err := DownloadFile(url, filePath, globalConfig.HttpProxy)
 		if err == nil {
 			log.Printf("Successfully downloaded %s to %s", url, filePath)
 			return
@@ -595,7 +754,7 @@ func DownloadFileWithRetry(url, filePath string) {
 	log.Printf("Failed to download %s to %s after %d attempts.", url, filePath, maxRetries)
 }
 
-func DownloadFile(urlStr, filePath string) error {
+func DownloadFile(urlStr, filePath, proxyURL string) error {
 	tempFilePath := filePath + ".tmp"
 	var file *os.File
 	var err error
@@ -628,13 +787,13 @@ func DownloadFile(urlStr, filePath string) error {
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment, // Default
 	}
-	if globalConfig.HttpProxy != "" {
-		proxyUrl, err := url.Parse(globalConfig.HttpProxy)
+	if proxyURL != "" {
+		pUrl, err := url.Parse(proxyURL)
 		if err == nil {
-			tr.Proxy = http.ProxyURL(proxyUrl)
-			log.Printf("Using proxy: %s", globalConfig.HttpProxy)
+			tr.Proxy = http.ProxyURL(pUrl)
+			log.Printf("Using proxy: %s", proxyURL)
 		} else {
-			log.Printf("Invalid proxy URL: %s, ignoring.", globalConfig.HttpProxy)
+			log.Printf("Invalid proxy URL: %s, ignoring.", proxyURL)
 		}
 	}
 
@@ -730,4 +889,20 @@ func DownloadFile(urlStr, filePath string) error {
 	}
 
 	return nil
+}
+
+func truncateFilename(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	s = s[:maxBytes]
+	for len(s) > 0 {
+		r, size := utf8.DecodeLastRuneInString(s)
+		if r == utf8.RuneError && size == 1 {
+			s = s[:len(s)-1]
+		} else {
+			break
+		}
+	}
+	return s
 }

@@ -50,13 +50,22 @@ chromeRemoteURL: http://localhost:9222/json/version
 
 # 缓存与下载目录
 CacheDir: ./cache
-DownDir: ./downloads
+DownDir: ./download
 
 # 下载并发数
 MaxDownloadWorkers: 3
 
 # HTTP 代理 (可选)
 # HttpProxy: http://127.0.0.1:7890
+
+# 即使配置了代理，也优先尝试直接下载 (可选)
+DirectDownloadFirst: true
+
+# 下载前清理缓存 (可选)
+ClearCache: true
+
+# 默认下载视频分辨率，如不配置或找不到对应分辨率，默认下载最高分辨率 (支持: 480p, 720p, 1080p)
+VideoResolution: "1080p"
 
 # 视频列表下载 (填入视频 ID)
 ListCode: 
@@ -123,13 +132,22 @@ chromeRemoteURL: http://localhost:9222/json/version
 
 # Directories
 CacheDir: ./cache
-DownDir: ./downloads
+DownDir: ./download
 
 # Number of concurrent download workers
 MaxDownloadWorkers: 3
 
 # HTTP Proxy (Optional)
 # HttpProxy: http://127.0.0.1:7890
+
+# Try direct download first even if proxy is configured (Optional)
+DirectDownloadFirst: true
+
+# Clear cache before downloading (Optional)
+ClearCache: true
+
+# Default video resolution (Supported: 480p, 720p, 1080p). Defaults to highest if not set or not found.
+VideoResolution: "1080p"
 
 # Download from Playlist IDs
 ListCode: 
@@ -152,7 +170,7 @@ SingleCode:
 ### Directory Structure
 Downloads are organized by video title:
 ```
-./downloads/
+./download/
   ├── Video_Title_A/
   │   ├── Video_Title_A.mp4
   │   └── Video_Title_A.jpg
