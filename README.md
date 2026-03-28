@@ -56,7 +56,7 @@ DownDir: ./download
 MaxDownloadWorkers: 3
 
 # HTTP 代理 (可选)
-# HttpProxy: http://127.0.0.1:7890
+HttpProxy: http://127.0.0.1:7890
 
 # 即使配置了代理，也优先尝试直接下载 (可选)
 DirectDownloadFirst: true
@@ -68,12 +68,14 @@ ClearCache: true
 VideoResolution: "1080p"
 
 # 视频列表下载 (填入视频 ID)
-ListCode: 
-  - 123456
+ListCode: [
+  123456,
+]
 
 # 单个视频下载 (填入视频 ID)
-SingleCode: 
-  - 654321
+SingleCode: [
+  654321,
+]
 ```
 
 #### 4. 运行
@@ -138,7 +140,7 @@ DownDir: ./download
 MaxDownloadWorkers: 3
 
 # HTTP Proxy (Optional)
-# HttpProxy: http://127.0.0.1:7890
+HttpProxy: http://127.0.0.1:7890
 
 # Try direct download first even if proxy is configured (Optional)
 DirectDownloadFirst: true

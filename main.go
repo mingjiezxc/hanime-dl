@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -30,6 +31,11 @@ const (
 	playlistSelector      = `#video-playlist-wrapper a`
 	downloadTitleSelector = `h3`
 	downloadImageSelector = `img.download-image`
+)
+
+var (
+	chromedpMu         sync.Mutex
+	globalChromeWSURL  string
 )
 
 type Config struct {
@@ -145,6 +151,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to get WebSocket debugger URL after %d attempts: %v", maxRetries, err)
 	}
+	globalChromeWSURL = croUrl
 
 	// Channel for fully resolved metadata ready for download
 	downloadQueue := make(chan VideoMetadata, 100)
@@ -168,7 +175,7 @@ func main() {
 				time.Sleep(3 * time.Second)
 				if meta.DataURL != "" && meta.VideoFilePath != "" {
 					if _, err := os.Stat(meta.VideoFilePath); os.IsNotExist(err) {
-						DownloadFileWithRetry(meta.DataURL, meta.VideoFilePath)
+						DownloadVideoWithRetry(meta)
 					} else {
 						log.Printf("[Worker %d] Video exists: %s", workerId, meta.VideoFilePath)
 					}
@@ -390,6 +397,9 @@ func ChromedpGetList(croUrl, videoID string) []string {
 	var idList []string
 	var err error
 
+	chromedpMu.Lock()
+	defer chromedpMu.Unlock()
+
 	for i := 0; i < maxRetries; i++ {
 		// Encapsulate attempt in a closure to ensure defers run immediately after attempt
 		idList, err = func() ([]string, error) {
@@ -469,6 +479,9 @@ func ResolveVideoInfo(croUrl, videoID, listID string) (VideoMetadata, error) {
 	for i := 0; i < maxRetries; i++ {
 		// Encapsulate attempt in a closure to ensure defers run immediately after attempt
 		meta, err = func() (VideoMetadata, error) {
+			chromedpMu.Lock()
+			defer chromedpMu.Unlock()
+
 			ctx1, cancel1 := context.WithTimeout(context.Background(), 3000*time.Second)
 			defer cancel1()
 
@@ -809,11 +822,11 @@ func DownloadFile(urlStr, filePath, proxyURL string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-		return fmt.Errorf("server returned 416 Range Not Satisfiable")
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status, URL: urlStr}
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("server returned status %s", resp.Status)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status, URL: urlStr}
 	}
 
 	if startOffset > 0 && resp.StatusCode == http.StatusOK {
@@ -889,6 +902,182 @@ func DownloadFile(urlStr, filePath, proxyURL string) error {
 	}
 
 	return nil
+}
+
+type HTTPStatusError struct {
+	StatusCode int
+	Status     string
+	URL        string
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e == nil {
+		return "http status error"
+	}
+	if e.URL == "" {
+		return fmt.Sprintf("server returned status %s", e.Status)
+	}
+	return fmt.Sprintf("server returned status %s for %s", e.Status, e.URL)
+}
+
+func DownloadVideoWithRetry(meta VideoMetadata) {
+	urlStr := meta.DataURL
+
+	for i := 0; i < maxRetries; i++ {
+		err := downloadOnceWithOptionalDirectFirst(urlStr, meta.VideoFilePath)
+		if err == nil {
+			log.Printf("Successfully downloaded %s to %s", urlStr, meta.VideoFilePath)
+			return
+		}
+
+		var statusErr *HTTPStatusError
+		if errors.As(err, &statusErr) {
+			if statusErr.StatusCode == http.StatusGone {
+				newURL, refreshErr := RefreshVideoDataURL(meta.VideoID, meta.Title)
+				if refreshErr != nil {
+					log.Printf("Failed to refresh download URL for %s after 410 Gone: %v", meta.VideoID, refreshErr)
+				} else {
+					urlStr = newURL
+					log.Printf("Refreshed download URL for %s, retrying...", meta.VideoID)
+					continue
+				}
+			}
+
+			if statusErr.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+				tempFilePath := meta.VideoFilePath + ".tmp"
+				if rmErr := os.Remove(tempFilePath); rmErr == nil {
+					log.Printf("Deleted temp file after 416 for %s, restarting download", meta.VideoID)
+					continue
+				}
+			}
+		}
+
+		log.Printf("Failed to download %s (attempt %d/%d): %v", urlStr, i+1, maxRetries, err)
+		if i < maxRetries-1 {
+			time.Sleep(retryInterval)
+		}
+	}
+	log.Printf("Failed to download %s to %s after %d attempts.", urlStr, meta.VideoFilePath, maxRetries)
+}
+
+func downloadOnceWithOptionalDirectFirst(urlStr, filePath string) error {
+	if globalConfig.DirectDownloadFirst {
+		log.Printf("Attempting direct download first for %s", urlStr)
+		err := DownloadFile(urlStr, filePath, "")
+		if err == nil {
+			return nil
+		}
+		var statusErr *HTTPStatusError
+		if errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusGone || statusErr.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
+			return err
+		}
+		log.Printf("Direct download failed: %v. Trying proxy...", err)
+	}
+	return DownloadFile(urlStr, filePath, globalConfig.HttpProxy)
+}
+
+func RefreshVideoDataURL(videoID, titleForLog string) (string, error) {
+	if globalChromeWSURL == "" {
+		return "", fmt.Errorf("chrome websocket url is empty; cannot refresh")
+	}
+
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		dataURL, err := func() (string, error) {
+			chromedpMu.Lock()
+			defer chromedpMu.Unlock()
+
+			ctx1, cancel1 := context.WithTimeout(context.Background(), 300*time.Second)
+			defer cancel1()
+
+			allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, globalChromeWSURL, chromedp.NoModifyURL)
+			defer cancelAllocator()
+
+			ctx, cancelCtx := chromedp.NewContext(allocatorContext)
+			defer cancelCtx()
+
+			var currentRes Result
+			var downloadLinks []map[string]string
+			if err := chromedp.Run(ctx,
+				chromedp.Navigate(fmt.Sprintf(hanimeDownloadURL, videoID)),
+				chromedp.WaitVisible(downloadTitleSelector, chromedp.ByQuery),
+				chromedp.Sleep(2*time.Second),
+				chromedp.Text(downloadTitleSelector, &currentRes.Title, chromedp.NodeVisible, chromedp.ByQuery),
+				chromedp.AttributeValue(downloadImageSelector, "src", &currentRes.ImageURL, nil, chromedp.ByQuery),
+				chromedp.Evaluate(`
+					Array.from(document.querySelectorAll('table.download-table tr')).slice(1).map(tr => {
+						let resTd = tr.querySelector('td:nth-child(2)');
+						let linkA = tr.querySelector('td:nth-child(5) a');
+						if (resTd && linkA) {
+							return {
+								resolution: resTd.innerText.trim(),
+								url: linkA.getAttribute('data-url')
+							};
+						}
+						return null;
+					}).filter(x => x !== null)
+				`, &downloadLinks),
+			); err != nil {
+				return "", err
+			}
+
+			if len(downloadLinks) == 0 {
+				return "", fmt.Errorf("no download links found")
+			}
+
+			selectedURL := ""
+			if globalConfig.VideoResolution != "" {
+				for _, linkInfo := range downloadLinks {
+					if strings.Contains(linkInfo["resolution"], globalConfig.VideoResolution) {
+						selectedURL = linkInfo["url"]
+						break
+					}
+				}
+			}
+			if selectedURL == "" {
+				selectedURL = downloadLinks[0]["url"]
+			}
+			if selectedURL == "" {
+				return "", fmt.Errorf("resolved data url is empty")
+			}
+
+			cacheFile := filepath.Join(globalConfig.CacheDir, fmt.Sprintf("info_%s.json", videoID))
+			if data, err := os.ReadFile(cacheFile); err == nil {
+				var cachedMeta VideoMetadata
+				if err := json.Unmarshal(data, &cachedMeta); err == nil {
+					cachedMeta.DataURL = selectedURL
+					if currentRes.Title != "" {
+						cachedMeta.Title = currentRes.Title
+					}
+					if currentRes.ImageURL != "" {
+						cachedMeta.ImageURL = currentRes.ImageURL
+					}
+					if cacheData, err := json.MarshalIndent(cachedMeta, "", "  "); err == nil {
+						os.WriteFile(cacheFile, cacheData, 0644)
+					}
+				}
+			}
+
+			if currentRes.Title != "" {
+				log.Printf("Refreshed DataURL for %s (%s)", videoID, currentRes.Title)
+			} else if titleForLog != "" {
+				log.Printf("Refreshed DataURL for %s (%s)", videoID, titleForLog)
+			} else {
+				log.Printf("Refreshed DataURL for %s", videoID)
+			}
+			return selectedURL, nil
+		}()
+
+		if err == nil {
+			return dataURL, nil
+		}
+		lastErr = err
+		if i < maxRetries-1 {
+			time.Sleep(retryInterval)
+		}
+	}
+
+	return "", fmt.Errorf("failed to refresh data url after retries: %w", lastErr)
 }
 
 func truncateFilename(s string, maxBytes int) string {
