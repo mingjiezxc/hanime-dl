@@ -1,24 +1,16 @@
 services:
-  app:
-    build: .
-    container_name: ubuntu
-    hostname: ubuntu
-    shm_size: 128mb
-    restart: always
-    environment:
-      # user root
-      - HTTP_PASSWORD=Password
-      # 配置 可访问 hanime1.me 的 HTTP 代理
-      # - HTTP_PROXY="http://192.168.188.1:3128"
-      # - HTTPS_PROXY="http://192.168.188.1:3128"
-    volumes:
-      - ./chrome.conf:/etc/supervisor/modules-enabled/99-chrome.conf
-      - ./chrome-stream.conf:/etc/nginx/modules-enabled/99-chrome-stream.conf
+  chrome-vnc:
+    #build: .
+    image: chrome-vnc:20260615
+    container_name: chrome-vnc
+    init: true
+    # 增加共享内存，防止 Chrome 崩溃 (1GB 或更高)
+    shm_size: '2gb'
     ports:
-      - 2080:80
-      - 9222:9000
-
-networks:
-  default:
-    external: true
-    name: share
+      - "6080:6080" # noVNC 网页桌面 (需 Basic Auth: admin/你的密码)
+      - "5900:5900" # 原生 VNC 端口
+      - "9222:9222" # Chrome CDP 远程调试代理端口
+    environment:
+      - VNC_PASSWORD=mEwXllS7gJu5bOGzEz8JdPJ1Ibz
+      - RESOLUTION=1440x2048x24
+    restart: unless-stopped

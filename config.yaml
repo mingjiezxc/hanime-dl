@@ -1,5 +1,5 @@
 #chromeRemoteURL: http://localhost:9222/json/version
-chromeRemoteURL: http://192.168.188.103:9222/json/version
+#chromeRemoteURL: http://192.168.188.103:9222/json/version
 # 缓存目录
 CacheDir: ./cache
 # 下载目录
@@ -16,7 +16,6 @@ ListCode: [
 ]
 # 要下载的单个视频
 SingleCode: [
-  166761,
  
 ]
 # 默认下载视频分辨率，如不配置或找不到对应分辨率，默认下载最高分辨率 (支持: 480p, 720p, 1080p)
