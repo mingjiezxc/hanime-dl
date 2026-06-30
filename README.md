@@ -2,7 +2,14 @@
 
 Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取和下载。
 
-## 📦 最新版本：v0.4.0 (2026-06-30)
+## 🌐 语言选择
+
+- 🇨🇳 [简体中文](#--简体中文)
+- 🇬🇧 [English](#-english)
+
+---
+
+## 📦 最新版本：v0.4.1 (2026-06-30)
 
 ### 新增特性
 - ✨ **Web 管理界面** - 提供可视化的视频下载管理界面
@@ -304,3 +311,104 @@ MIT License
 
 - [chromedp](https://github.com/chromedp/chromedp) - Chrome DevTools Protocol 库
 - [gopkg.in/yaml.v3](https://gopkg.in/yaml.v3) - YAML 解析库
+
+---
+
+## 🇬🇧 English
+
+### Latest Version: v0.4.1 (2026-06-30)
+
+#### What's New
+- ✨ **Web Management Interface** - Visual video download management
+- 🎨 **Modular Refactoring** - Clean project structure (chrome/, config/, scraper/, downloader/, web/)
+- 📊 **Real-time Progress** - Visual download status
+- 🔄 **Batch Operations** - Manage download tasks via Web interface
+
+#### Features
+- 🎬 Single video download support
+- 📋 Playlist batch download support
+- 🔄 Resume interrupted downloads
+- 📦 Download progress caching
+- 🌐 Proxy configuration support
+- 🎨 Multiple resolution options
+- ⚡ Multi-threaded concurrent downloads
+
+#### Quick Start
+
+**Prerequisites**
+- Go 1.19+
+- Google Chrome or Chromium browser
+
+**Build**
+```bash
+# Clone the repository
+git clone <repository-url>
+cd hanime-dl
+
+# Download dependencies
+go mod download
+
+# Build
+go build -o hanime-dl .
+```
+
+**Configuration**
+Edit `config.yaml`:
+```yaml
+chromeRemoteURL: http://localhost:9222/json/version
+CacheDir: ./cache
+DownDir: ./downloads
+HttpProxy: http://proxy.example.com:8080
+DirectDownloadFirst: true
+MaxDownloadWorkers: 3
+VideoResolution: 1080p
+```
+
+**Chrome Setup**
+```bash
+# Linux
+google-chrome --remote-debugging-port=9222
+
+# macOS
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222
+
+# Windows
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+```
+
+**Run**
+```bash
+# Default configuration
+./hanime-dl
+
+# Web server mode
+./hanime-dl -web -web-addr :8080
+
+# View help
+./hanime-dl -h
+```
+
+**Web Interface**
+Access `http://localhost:8080` for:
+- 📱 Responsive design (mobile-friendly)
+- 📋 View download queue and progress
+- ⚙️ Configure download parameters
+- 🎬 Manage video download tasks
+- 📊 Real-time download status
+
+#### Releases
+- **v0.4.1**: Modular refactoring, Web interface added
+- **v0.4.0**: Initial modular architecture
+- **v0.3.1**: Bug fixes and improvements
+
+Download binaries from [GitHub Releases](https://github.com/mingjiezxc/hanime-dl/releases)
+
+#### License
+MIT License
+
+#### Contributing
+Issues and Pull Requests are welcome!
+
+#### Acknowledgments
+- [chromedp](https://github.com/chromedp/chromedp) - Chrome DevTools Protocol library
+- [gopkg.in/yaml.v3](https://gopkg.in/yaml.v3) - YAML parsing library
