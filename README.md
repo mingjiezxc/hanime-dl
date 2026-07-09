@@ -142,6 +142,51 @@ VideoResolution: 1080p
 
 ## 使用方法
 
+### 运行程序
+
+```bash
+# 使用默认配置
+./hanime-dl
+
+# 指定配置文件
+./hanime-dl -config /path/to/config.yaml
+
+# 查看帮助
+./hanime-dl -h
+```
+
+### 命令行参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-config` | `config.yaml` | 配置文件路径 |
+| `-web` | `false` | 启动 Web 服务器模式 |
+| `-web-addr` | `:8080` | Web 服务器地址 |
+
+### Web 界面使用 （推荐）
+
+启动 Web 服务器模式：
+直接如无配置CDP 或 连接失败 ,默认会启动本地 Chrome 实例,并连接到该实例
+
+```bash
+# 使用默认配置启动 Web 服务器
+./hanime-dl -web
+
+# 指定端口
+./hanime-dl -web -web-addr :3000
+
+# 访问 Web 界面
+# 打开浏览器访问 http://localhost:8080
+```
+
+Web 界面功能：
+- 📱 响应式设计，支持移动端访问
+- 📋 查看下载队列和进度
+- ⚙️ 配置下载参数
+- 🎬 管理视频下载任务
+- 📊 实时显示下载状态
+
+
 ### Chrome 浏览器设置
 
 #### 方式 1：手动启动 Chrome（推荐）
@@ -172,48 +217,6 @@ docker compose up -d
 chromeRemoteURL: http://your-chrome-host:9222/json/version
 ```
 
-### 运行程序
-
-```bash
-# 使用默认配置
-./hanime-dl
-
-# 指定配置文件
-./hanime-dl -config /path/to/config.yaml
-
-# 查看帮助
-./hanime-dl -h
-```
-
-### 命令行参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-config` | `config.yaml` | 配置文件路径 |
-| `-web` | `false` | 启动 Web 服务器模式 |
-| `-web-addr` | `:8080` | Web 服务器地址 |
-
-### Web 界面使用
-
-启动 Web 服务器模式：
-
-```bash
-# 使用默认配置启动 Web 服务器
-./hanime-dl -web
-
-# 指定端口
-./hanime-dl -web -web-addr :3000
-
-# 访问 Web 界面
-# 打开浏览器访问 http://localhost:8080
-```
-
-Web 界面功能：
-- 📱 响应式设计，支持移动端访问
-- 📋 查看下载队列和进度
-- ⚙️ 配置下载参数
-- 🎬 管理视频下载任务
-- 📊 实时显示下载状态
 
 ## 工作流程
 
