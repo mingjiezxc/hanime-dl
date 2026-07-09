@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/chromedp/chromedp"
@@ -477,14 +476,7 @@ func StartLocalChrome() (string, error) {
 	launcher.cmd.Stderr = os.Stderr
 
 	// 平台特定的进程管理
-	if runtime.GOOS != "windows" {
-		// Unix/Linux/macOS: 使用进程组
-		launcher.cmd.SysProcAttr = &syscall.SysProcAttr{
-			Setsid: true,
-		}
-	}
-	// Windows: 使用默认设置，不设置特殊属性
-	// Windows 的进程管理由 exec.Command 自动处理
+	setProcessGroupAttr(launcher.cmd)
 
 	if err := launcher.cmd.Start(); err != nil {
 		return "", fmt.Errorf("failed to start Chrome: %w", err)
@@ -511,22 +503,7 @@ func StartLocalChrome() (string, error) {
 func (l *Launcher) Cleanup() {
 	if l.cmd != nil && l.cmd.Process != nil {
 		log.Println("Cleaning up Chrome process...")
-
-		if runtime.GOOS == "windows" {
-			// Windows: 尝试终止进程
-			l.cmd.Process.Kill()
-		} else {
-			// Unix/Linux/macOS: 终止整个进程组
-			pgid, err := syscall.Getpgid(l.cmd.Process.Pid)
-			if err == nil {
-				syscall.Kill(-pgid, syscall.SIGTERM)
-				// 等待一下，如果还没结束则强制终止
-				time.Sleep(1 * time.Second)
-				syscall.Kill(-pgid, syscall.SIGKILL)
-			} else {
-				l.cmd.Process.Kill()
-			}
-		}
+		cleanupProcess(l.cmd)
 	}
 }
 

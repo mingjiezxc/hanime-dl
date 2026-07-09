@@ -61,10 +61,13 @@ rm -rf $RELEASE_DIR
 mkdir -p $RELEASE_DIR
 
 # 4. 交叉编译
-echo "🛠️  正在为 Linux, Windows, macOS 交叉编译..."
+echo "🛠️  正在为 Linux, Windows, macOS (amd64 + arm64) 交叉编译..."
 GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-linux-amd64" .
+GOOS=linux   GOARCH=arm64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-linux-arm64" .
 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-windows-amd64.exe" .
+GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-windows-arm64.exe" .
 GOOS=darwin  GOARCH=amd64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-macos-amd64" .
+GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-macos-arm64" .
 
 if [ $? -ne 0 ]; then
     echo "❌ 编译失败。"
@@ -76,13 +79,19 @@ echo "✅ 编译成功！"
 echo "📦 正在打包文件..."
 cd $RELEASE_DIR
 zip "${APP_NAME}-windows-amd64.zip" "${APP_NAME}-windows-amd64.exe"
+zip "${APP_NAME}-windows-arm64.zip" "${APP_NAME}-windows-arm64.exe"
 tar -czvf "${APP_NAME}-linux-amd64.tar.gz" "${APP_NAME}-linux-amd64"
+tar -czvf "${APP_NAME}-linux-arm64.tar.gz" "${APP_NAME}-linux-arm64"
 tar -czvf "${APP_NAME}-macos-amd64.tar.gz" "${APP_NAME}-macos-amd64"
+tar -czvf "${APP_NAME}-macos-arm64.tar.gz" "${APP_NAME}-macos-arm64"
 
 # 删除未打包的二进制文件，只保留压缩包
 rm "${APP_NAME}-windows-amd64.exe"
+rm "${APP_NAME}-windows-arm64.exe"
 rm "${APP_NAME}-linux-amd64"
+rm "${APP_NAME}-linux-arm64"
 rm "${APP_NAME}-macos-amd64"
+rm "${APP_NAME}-macos-arm64"
 
 cd ..
 echo "✅ 打包完成！"
