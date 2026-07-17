@@ -34,16 +34,29 @@ func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("server returned status %s for %s", e.Status, e.URL)
 }
 
+// ProgressCallback 下载进度回调函数
+type ProgressCallback func(downloaded, total int64)
+
 // ProgressWriter 进度追踪器
 type ProgressWriter struct {
 	Total      int64
 	Downloaded int64
 	FileName   string
+	Callback   ProgressCallback
+	lastCB     time.Time
 }
 
 func (pw *ProgressWriter) Write(p []byte) (int, error) {
 	n := len(p)
 	pw.Downloaded += int64(n)
+	// 限流回调，避免频繁加锁（最多每 500ms 一次）
+	if pw.Callback != nil {
+		now := time.Now()
+		if now.Sub(pw.lastCB) >= 500*time.Millisecond {
+			pw.lastCB = now
+			pw.Callback(pw.Downloaded, pw.Total)
+		}
+	}
 	return n, nil
 }
 
@@ -63,6 +76,15 @@ func NewDownloader(proxyURL string, directFirst bool) *Downloader {
 
 // DownloadFile 下载文件（支持断点续传）
 func (d *Downloader) DownloadFile(urlStr, filePath string) error {
+	return d.downloadFile(urlStr, filePath, nil)
+}
+
+// DownloadFileCB 下载文件并回调进度（支持断点续传）
+func (d *Downloader) DownloadFileCB(urlStr, filePath string, cb ProgressCallback) error {
+	return d.downloadFile(urlStr, filePath, cb)
+}
+
+func (d *Downloader) downloadFile(urlStr, filePath string, cb ProgressCallback) error {
 	tempFilePath := filePath + ".tmp"
 
 	// 检查是否已存在临时文件
@@ -139,9 +161,10 @@ func (d *Downloader) DownloadFile(urlStr, filePath string) error {
 	}
 
 	pw := &ProgressWriter{
-		Total:    totalSize,
+		Total:      totalSize,
 		Downloaded: startOffset,
-		FileName: filepath.Base(filePath),
+		FileName:   filepath.Base(filePath),
+		Callback:   cb,
 	}
 
 	// 进度打印协程
@@ -177,6 +200,10 @@ func (d *Downloader) DownloadFile(urlStr, filePath string) error {
 	}
 
 	file.Close()
+	// 下载完成，回调最终进度
+	if cb != nil {
+		cb(pw.Downloaded, pw.Total)
+	}
 	log.Printf("[%s] Downloaded %d bytes (Total: %d)", pw.FileName, n, pw.Downloaded)
 
 	if err := os.Rename(tempFilePath, filePath); err != nil {
@@ -188,19 +215,17 @@ func (d *Downloader) DownloadFile(urlStr, filePath string) error {
 
 // DownloadWithRetry 带重试的下载
 func (d *Downloader) DownloadWithRetry(urlStr, filePath string) error {
-	for i := 0; i < MaxRetries; i++ {
-		// 如果配置了直接下载优先，先尝试直接下载
-		if d.directDownloadFirst {
-			log.Printf("Attempting direct download first for %s", urlStr)
-			err := d.DownloadFile(urlStr, filePath)
-			if err == nil {
-				log.Printf("Successfully downloaded %s to %s (Direct)", urlStr, filePath)
-				return nil
-			}
-			log.Printf("Direct download failed: %v. Switching to proxy...", err)
-		}
+	return d.downloadWithRetry(urlStr, filePath, nil)
+}
 
-		err := d.DownloadFile(urlStr, filePath)
+// DownloadWithRetryCB 带重试的下载并回调进度
+func (d *Downloader) DownloadWithRetryCB(urlStr, filePath string, cb ProgressCallback) error {
+	return d.downloadWithRetry(urlStr, filePath, cb)
+}
+
+func (d *Downloader) downloadWithRetry(urlStr, filePath string, cb ProgressCallback) error {
+	for i := 0; i < MaxRetries; i++ {
+		err := d.downloadFile(urlStr, filePath, cb)
 		if err == nil {
 			log.Printf("Successfully downloaded %s to %s", urlStr, filePath)
 			return nil

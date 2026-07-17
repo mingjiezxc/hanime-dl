@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	chromeDownURL       = "https://hanime1.me/download?v=%s"
+	chromeDownURL         = "https://hanime1.me/download?v=%s"
 	downloadTitleSelector = `h3`
 	downloadImageSelector = `img.download-image`
 )
@@ -63,14 +63,14 @@ func (s *Scraper) GetPlaylist(wsURL, videoID string) ([]string, error) {
 	cacheFile := filepath.Join(s.cacheDir, fmt.Sprintf("list_%s.json", videoID))
 	if data, err := os.ReadFile(cacheFile); err == nil {
 		var cachedList []string
-		if err := json.Unmarshal(data, &cachedList); err == nil {
-			log.Printf("Loaded playlist %s from cache", videoID)
+		if err := json.Unmarshal(data, &cachedList); err == nil && len(cachedList) > 0 {
+			log.Printf("Loaded playlist %s from cache (%d items)", videoID, len(cachedList))
 			return cachedList, nil
 		}
 	}
 
 	// 从网页获取
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 300*time.Second)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel1()
 
 	allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, wsURL, chromedp.NoModifyURL)
@@ -79,31 +79,58 @@ func (s *Scraper) GetPlaylist(wsURL, videoID string) ([]string, error) {
 	ctx, cancelCtx := chromedp.NewContext(allocatorContext)
 	defer cancelCtx()
 
-	var links []map[string]string
+	// 用 JS 直接提取播放列表里的所有视频 ID。
+	// 真实页面结构：播放列表容器 id 为 #playlist-scroll，每个视频项外层是
+	// <div class="playlist-hover-wrap clickable-row" data-href="https://hanime1.me/watch?v=xxx">，
+	// data-href 即视频地址，最精确。退而求其次取容器内 a[href*="watch?v="]。
+	extractJS := `(function(){
+		var wrap = document.querySelector('#playlist-scroll');
+		if(!wrap){ return []; }
+		var nodes = wrap.querySelectorAll('.playlist-hover-wrap');
+		if(nodes.length === 0){
+			nodes = wrap.querySelectorAll('a[href*="watch?v="]');
+		}
+		var seen = {};
+		var out = [];
+		nodes.forEach(function(n){
+			var href = n.getAttribute('data-href') || n.getAttribute('href');
+			if(!href){ return; }
+			try {
+				var u = new URL(href, location.href);
+				var v = u.searchParams.get('v');
+				if(v && !seen[v]){ seen[v] = true; out.push(v); }
+			} catch(e){}
+		});
+		return out;
+	})()`
+
+	var raw []interface{}
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(fmt.Sprintf("https://hanime1.me/watch?v=%s", videoID)),
 		chromedp.Sleep(5*time.Second),
-		chromedp.AttributesAll(`#video-playlist-wrapper a`, &links, chromedp.ByQueryAll),
+		chromedp.Evaluate(extractJS, &raw),
 	)
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch playlist %s: %w", videoID, err)
 	}
 
-	var result []string
-	idMap := make(map[string]int)
-	for _, link := range links {
-		if v, ok := link["class"]; ok && v == "overlay" {
-			if href, okHref := link["href"]; okHref {
-				parts := strings.Split(href, "=")
-				if len(parts) > 1 {
-					idMap[parts[1]] = 0
-				}
-			}
+	result := make([]string, 0, len(raw))
+	seen := make(map[string]bool)
+	for _, item := range raw {
+		id, ok := item.(string)
+		if !ok || id == "" {
+			continue
 		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		result = append(result, id)
 	}
-	for k := range idMap {
-		result = append(result, k)
+
+	if len(result) == 0 {
+		return nil, fmt.Errorf("playlist %s returned no video ids (page structure may have changed)", videoID)
 	}
 
 	// 保存到缓存
@@ -111,6 +138,7 @@ func (s *Scraper) GetPlaylist(wsURL, videoID string) ([]string, error) {
 		os.WriteFile(cacheFile, cacheData, 0644)
 	}
 
+	log.Printf("Fetched playlist %s: %d videos", videoID, len(result))
 	return result, nil
 }
 
@@ -189,9 +217,9 @@ func (s *Scraper) ResolveVideoInfo(wsURL, videoID, listID string) (VideoMetadata
 	}
 
 	// 尝试获取高清封面图
-	searchURL := fmt.Sprintf("https://hanime1.me/search?query=%s", 
+	searchURL := fmt.Sprintf("https://hanime1.me/search?query=%s",
 		url.QueryEscape(strings.TrimSpace(res.Title))) + "&type=&genre=%E8%A3%85%E7%95%8C&sort=&date=&duration="
-	
+
 	var searchImgUrl string
 	searchCtx, searchCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer searchCancel()

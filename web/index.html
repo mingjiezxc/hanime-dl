@@ -616,7 +616,7 @@
             }
 
             // 按创建时间倒序排序
-            tasks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            tasks.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
             container.innerHTML = tasks.map(task => {
                 const progress = task.progress || 0;
@@ -656,7 +656,7 @@
                             ` : ''}
                             <div class="task-info-item">
                                 <div class="task-info-label">创建时间</div>
-                                <div class="task-info-value">${formatDate(task.createdAt)}</div>
+                                <div class="task-info-value">${formatDate(task.created_at)}</div>
                             </div>
                             ${task.completed_at ? `
                             <div class="task-info-item">

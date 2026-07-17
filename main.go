@@ -76,7 +76,20 @@ func main() {
 			}()
 		}
 
-		web.RunWebServer(*webAddr, cfg.CacheDir, cfg.DownDir, cfg.MaxDownloadWorkers)
+		web.RunWebServer(web.Options{
+			Addr:                *webAddr,
+			CacheDir:            cfg.CacheDir,
+			DownDir:             cfg.DownDir,
+			MaxWorkers:          cfg.MaxDownloadWorkers,
+			ChromeRemoteURL:     cfg.ChromeRemoteURL,
+			WSURL:               wsURL,
+			HTTPProxy:           cfg.HttpProxy,
+			DirectDownloadFirst: cfg.DirectDownloadFirst,
+			VideoResolution:     cfg.VideoResolution,
+			ClearCache:          cfg.ClearCache,
+			SingleCode:          cfg.SingleCode,
+			ListCode:           cfg.ListCode,
+		})
 		return
 	}
 

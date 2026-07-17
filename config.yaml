@@ -1,22 +1,17 @@
-#chromeRemoteURL: http://localhost:9222/json/version
-#chromeRemoteURL: http://192.168.188.103:9222/json/version
-# 缓存目录
+chromeRemoteURL: http://192.168.188.103:9222/json/version
+
 CacheDir: ./cache
-# 下载目录
 DownDir: ./download
-# 下载时使用的代理地址
 HttpProxy: http://192.168.188.1:3128
-# 最大下载线程数
 MaxDownloadWorkers: 2
-# 即使配置代理，都尝试直接下载
 DirectDownloadFirst: true
-# 要下载的视频列表
 ListCode: [
+  407019,
+  407014,
 
 ]
-# 要下载的单个视频
+
 SingleCode: [
- 
 ]
 # 默认下载视频分辨率，如不配置或找不到对应分辨率，默认下载最高分辨率 (支持: 480p, 720p, 1080p)
 VideoResolution: "720p"
