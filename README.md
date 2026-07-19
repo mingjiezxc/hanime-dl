@@ -11,7 +11,7 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 
 ---
 
-## 📦 最新版本：v0.4.1 (2026-06-30)
+## 📦 最新版本：v0.4.2 (2026-07-19)
 
 ### 新增特性
 - ✨ **Web 管理界面** - 提供可视化的视频下载管理界面
@@ -26,6 +26,10 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 - 新增 `scraper/` 模块独立网页抓取逻辑
 - 新增 `downloader/` 模块独立文件下载逻辑
 - 新增 `config/` 模块独立配置管理
+
+### v0.4.2 修复 (2026-07-19)
+- 🐛 **目录自动创建** - 修复下载时目标父目录（如 `download/<影片名>/`）不存在导致临时文件创建失败的问题，现会在写入前自动 `MkdirAll` 父目录
+- 🐛 **新标签页代替新窗口** - 修复 chromedp 在远程浏览器下每次抓取都会打开「新窗口」的问题，改为在已有浏览器中打开「新标签页」（新增 `chrome.CreateTab()`，`scraper` 通过 `WithTargetID` 附着，任务结束自动关闭标签页）
 
 ## 功能特性
 
@@ -62,7 +66,7 @@ hanime-dl/
 | 模块 | 功能 | 主要函数 |
 |------|------|----------|
 | `config` | 配置管理 | `Load()`, `MustLoad()` |
-| `chrome` | Chrome 浏览器管理 | `GetWebSocketDebuggerURL()`, `AutoDetectChrome()`, `StartLocalChrome()` |
+| `chrome` | Chrome 浏览器管理 | `GetWebSocketDebuggerURL()`, `AutoDetectChrome()`, `StartLocalChrome()`, `CreateTab()` |
 | `scraper` | 网页抓取 | `GetPlaylist()`, `ResolveVideoInfo()`, `RefreshVideoDataURL()` |
 | `downloader` | 文件下载 | `DownloadFile()`, `DownloadWithRetry()` |
 | `web` | Web 服务器 | `RunWebServer()`, `NewWebServer()` |
@@ -321,7 +325,7 @@ MIT License
 
 ## 🇬🇧 English
 
-### Latest Version: v0.4.1 (2026-06-30)
+### Latest Version: v0.4.2 (2026-07-19)
 
 #### What's New
 - ✨ **Web Management Interface** - Visual video download management
@@ -402,6 +406,7 @@ Access `http://localhost:8080` for:
 - 📊 Real-time download status
 
 #### Releases
+- **v0.4.2**: Bug fixes - auto-create download dirs, open new tab instead of new window (`CreateTab`)
 - **v0.4.1**: Modular refactoring, Web interface added
 - **v0.4.0**: Initial modular architecture
 - **v0.3.1**: Bug fixes and improvements
