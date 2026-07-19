@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -49,6 +50,9 @@ type Options struct {
 	// 让页面打开即可看到"要下载的列表"。
 	SingleCode []string
 	ListCode   []string
+	// EmbedFS 内嵌的静态资源文件系统（来自 //go:embed web/*），
+	// 为 nil 时回退到本地 ./web 目录（开发场景）。
+	EmbedFS fs.FS
 }
 
 // WebServer manages the web interface and the download pipeline
@@ -71,6 +75,8 @@ type WebServer struct {
 	queue      chan *TaskStatus
 	maxWorkers int
 
+	embedFS fs.FS
+
 	seen      map[string]bool
 	seenMutex sync.Mutex
 }
@@ -92,6 +98,7 @@ func NewWebServer(opts Options) *WebServer {
 		wsURL:           opts.WSURL,
 		queue:           make(chan *TaskStatus, 1000),
 		maxWorkers:      maxWorkers,
+		embedFS:         opts.EmbedFS,
 		seen:            make(map[string]bool),
 	}
 }
@@ -174,13 +181,26 @@ func (ws *WebServer) refreshWSURL() (string, error) {
 // --- HTTP 路由 ---
 
 // SetupRoutes sets up the HTTP routes for the web server
-func (ws *WebServer) SetupRoutes() {
+func (ws *WebServer) SetupRoutes() error {
 	http.HandleFunc("/api/tasks", ws.handleTasks)
 	http.HandleFunc("/api/tasks/", ws.handleTaskByID)
 	http.HandleFunc("/api/submit", ws.handleSubmit)
 	http.HandleFunc("/api/status/", ws.handleStatus)
 	http.HandleFunc("/api/progress", ws.handleProgress)
-	http.Handle("/", http.FileServer(http.Dir("./web")))
+
+	// 静态资源：优先使用内嵌文件系统，未提供时回退到本地 ./web 目录（开发场景）
+	var staticFS fs.FS
+	if ws.embedFS != nil {
+		sub, err := fs.Sub(ws.embedFS, "web")
+		if err != nil {
+			return fmt.Errorf("build embedded web fs: %w", err)
+		}
+		staticFS = sub
+	} else {
+		staticFS = os.DirFS("./web")
+	}
+	http.Handle("/", http.FileServer(http.FS(staticFS)))
+	return nil
 }
 
 func writeJSONHeaders(w http.ResponseWriter) {
@@ -520,7 +540,9 @@ func (ws *WebServer) refreshDataURL(videoID string) (string, error) {
 
 // Start starts the web server
 func (ws *WebServer) Start(addr string) error {
-	ws.SetupRoutes()
+	if err := ws.SetupRoutes(); err != nil {
+		return err
+	}
 
 	ws.server = &http.Server{
 		Addr:        addr,

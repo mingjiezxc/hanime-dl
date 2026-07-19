@@ -1,6 +1,7 @@
 package main
 
 import (
+	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,6 +21,9 @@ import (
 	"hanime-dl/scraper"
 	"hanime-dl/web"
 )
+
+//go:embed web/*
+var embeddedWebFS embed.FS
 
 var globalConfig *config.Config
 
@@ -49,7 +53,10 @@ func main() {
 
 	// Web 模式
 	if *webMode {
-		cfg := config.MustLoad(*configPath)
+		cfg, created := config.MustLoadOrCreate(*configPath)
+		if created {
+			log.Printf("Config not found at %s, generated default config. Please review and edit it as needed.", *configPath)
+		}
 		cfg.ClearCache = true
 		wsURL, launchedLocalChrome, err := chrome.EnsureChromeConnectionDetailed(cfg.ChromeRemoteURL, chrome.StartupCDPTimeout)
 		if err != nil {
@@ -88,13 +95,17 @@ func main() {
 			VideoResolution:     cfg.VideoResolution,
 			ClearCache:          cfg.ClearCache,
 			SingleCode:          cfg.SingleCode,
-			ListCode:           cfg.ListCode,
+			ListCode:            cfg.ListCode,
+			EmbedFS:             embeddedWebFS,
 		})
 		return
 	}
 
 	// 加载配置
-	globalConfig = config.MustLoad(*configPath)
+	globalConfig, created := config.MustLoadOrCreate(*configPath)
+	if created {
+		log.Printf("Config not found at %s, generated default config. Please review and edit it as needed.", *configPath)
+	}
 	globalConfig.ClearCache = true
 
 	// 确保目录存在

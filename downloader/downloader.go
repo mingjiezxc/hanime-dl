@@ -87,6 +87,13 @@ func (d *Downloader) DownloadFileCB(urlStr, filePath string, cb ProgressCallback
 func (d *Downloader) downloadFile(urlStr, filePath string, cb ProgressCallback) error {
 	tempFilePath := filePath + ".tmp"
 
+	// 确保目标文件的父目录存在，否则创建临时文件会失败
+	if dir := filepath.Dir(tempFilePath); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
 	// 检查是否已存在临时文件
 	var startOffset int64 = 0
 	fileInfo, err := os.Stat(tempFilePath)
