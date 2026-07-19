@@ -314,6 +314,64 @@ func OpenURL(wsURL, targetURL string, timeout time.Duration) error {
 	return err
 }
 
+// CreateTab 通过 DevTools HTTP 端点在已有浏览器中打开一个新的「标签页」（而非新窗口），
+// 返回新标签页的 target id，供 chromedp.WithTargetID 附着使用。
+// 这样可以避免 chromedp（v0.13.x）在远程 allocator 下默认以 newWindow=true 创建新窗口的行为。
+func CreateTab(wsURL, targetURL string, timeout time.Duration) (string, error) {
+	if wsURL == "" {
+		return "", errors.New("CDP websocket URL is empty")
+	}
+	if targetURL == "" {
+		targetURL = "about:blank"
+	}
+	if timeout <= 0 {
+		timeout = OpenPageTimeout
+	}
+
+	devtoolsURL, err := devToolsNewTabURL(wsURL, targetURL)
+	if err != nil {
+		return "", err
+	}
+
+	client := &http.Client{Timeout: timeout}
+	req, err := http.NewRequest(http.MethodPut, devtoolsURL, http.NoBody)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		// 兼容旧版 Chrome：回退到 GET
+		fallbackReq, fbErr := http.NewRequest(http.MethodGet, devtoolsURL, http.NoBody)
+		if fbErr != nil {
+			return "", err
+		}
+		resp, err = client.Do(fallbackReq)
+		if err != nil {
+			return "", err
+		}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading new tab response failed: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("devtools endpoint returned status %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var info struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return "", fmt.Errorf("parse new tab response failed: %w", err)
+	}
+	if info.ID == "" {
+		return "", errors.New("new tab id is empty")
+	}
+	return info.ID, nil
+}
+
 func devToolsNewTabURL(wsURL, targetURL string) (string, error) {
 	parsedWSURL, err := url.Parse(wsURL)
 	if err != nil {

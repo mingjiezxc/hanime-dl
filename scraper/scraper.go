@@ -13,8 +13,24 @@ import (
 	"unicode/utf8"
 
 	"github.com/chromedp/cdproto/runtime"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
+
+	"hanime-dl/chrome"
 )
+
+// newTabContext 在已有浏览器中打开一个新「标签页」（而非新窗口）并返回附着其上的 chromedp context。
+// 说明：chromedp v0.13.x 在远程 allocator 下会强制以 newWindow=true 创建新窗口，
+// 这里改为先通过 DevTools 创建标签页拿到 target id，再用 WithTargetID 附着，
+// 取消返回的 cancel 时 chromedp 会自动关闭该标签页。
+func newTabContext(allocatorContext context.Context, wsURL string) (context.Context, context.CancelFunc, error) {
+	tabID, err := chrome.CreateTab(wsURL, "about:blank", 15*time.Second)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open new tab: %w", err)
+	}
+	ctx, cancel := chromedp.NewContext(allocatorContext, chromedp.WithTargetID(target.ID(tabID)))
+	return ctx, cancel, nil
+}
 
 const (
 	chromeDownURL         = "https://hanime1.me/download?v=%s"
@@ -76,7 +92,10 @@ func (s *Scraper) GetPlaylist(wsURL, videoID string) ([]string, error) {
 	allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, wsURL, chromedp.NoModifyURL)
 	defer cancelAllocator()
 
-	ctx, cancelCtx := chromedp.NewContext(allocatorContext)
+	ctx, cancelCtx, err := newTabContext(allocatorContext, wsURL)
+	if err != nil {
+		return nil, err
+	}
 	defer cancelCtx()
 
 	// 用 JS 直接提取播放列表里的所有视频 ID。
@@ -105,7 +124,7 @@ func (s *Scraper) GetPlaylist(wsURL, videoID string) ([]string, error) {
 	})()`
 
 	var raw []interface{}
-	err := chromedp.Run(ctx,
+	err = chromedp.Run(ctx,
 		chromedp.Navigate(fmt.Sprintf("https://hanime1.me/watch?v=%s", videoID)),
 		chromedp.Sleep(5*time.Second),
 		chromedp.Evaluate(extractJS, &raw),
@@ -161,12 +180,15 @@ func (s *Scraper) ResolveVideoInfo(wsURL, videoID, listID string) (VideoMetadata
 	allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, wsURL, chromedp.NoModifyURL)
 	defer cancelAllocator()
 
-	ctx, cancelCtx := chromedp.NewContext(allocatorContext)
+	ctx, cancelCtx, err := newTabContext(allocatorContext, wsURL)
+	if err != nil {
+		return VideoMetadata{}, err
+	}
 	defer cancelCtx()
 
 	var res Result
 	var downloadLinks []map[string]string
-	err := chromedp.Run(ctx,
+	err = chromedp.Run(ctx,
 		chromedp.Navigate(fmt.Sprintf(chromeDownURL, videoID)),
 		chromedp.WaitVisible(downloadTitleSelector, chromedp.ByQuery),
 		chromedp.Sleep(2*time.Second),
@@ -313,12 +335,15 @@ func (s *Scraper) RefreshVideoDataURL(wsURL, videoID string) (string, error) {
 	allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, wsURL, chromedp.NoModifyURL)
 	defer cancelAllocator()
 
-	ctx, cancelCtx := chromedp.NewContext(allocatorContext)
+	ctx, cancelCtx, err := newTabContext(allocatorContext, wsURL)
+	if err != nil {
+		return "", err
+	}
 	defer cancelCtx()
 
 	var res Result
 	var downloadLinks []map[string]string
-	err := chromedp.Run(ctx,
+	err = chromedp.Run(ctx,
 		chromedp.Navigate(fmt.Sprintf(chromeDownURL, videoID)),
 		chromedp.WaitVisible(downloadTitleSelector, chromedp.ByQuery),
 		chromedp.Sleep(2*time.Second),
