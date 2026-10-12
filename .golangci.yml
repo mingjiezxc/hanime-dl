@@ -1,0 +1,50 @@
+# golangci-lint 配置（schema v2）
+#
+# 本仓库以 golangci-lint v2.14.0 验证。v2 的配置结构与 v1 不兼容，注意区别：
+#   - 使用 linters.default / linters.enable（v1 是 linters.enable + linters.disable）
+#   - linters.settings 取代 v1 的 linters-settings
+#   - gofmt 等「格式化器」独立到 formatters 段，不再属于 linters
+#
+# 只读 HOME 环境（本机 /root/.cache/go-build 只读）下运行前请先设置：
+#   export GOCACHE=$PWD/.dbg/gocache
+#   export GOLANGCI_LINT_CACHE=$PWD/.dbg/golangci-cache
+#
+# 用法：make lint  或  golangci-lint run ./...
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  # standard = errcheck、govet、ineffassign、staticcheck、unused
+  default: standard
+  enable:
+    - gocritic
+    - bodyclose
+  settings:
+    errcheck:
+      # 不把「类型断言未检查」当作错误，避免与既有代码风格冲突。
+      check-type-assertions: false
+      # 不检查显式赋值给 _ 的情况。
+      check-blank: false
+    gocritic:
+      # 只启用诊断类与性能类检查；style/opinionated/experimental 会引入
+      # 大量纯风格告警，与本仓库「先清空既有缺陷」的目标不符。
+      enabled-tags:
+        - diagnostic
+        - performance
+  exclusions:
+    generated: lax
+    paths:
+      # .dbg/ 是本地构建缓存与 GOPATH（内含 1 万+ 第三方 .go 文件），必须排除。
+      - .dbg
+      - ^third_party/
+
+formatters:
+  enable:
+    - gofmt
+  exclusions:
+    paths:
+      - .dbg

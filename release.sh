@@ -14,8 +14,19 @@
 #   若未提供版本号，则自动在最新标签上增加 0.0.1（补丁位）
 #
 # =============================================================================
-export http_proxy=http://192.168.188.1:3128
-export https_proxy=http://192.168.188.1:3128
+# 任一命令失败立即中止（含管道中的失败），避免"构建失败但脚本继续"。
+set -euo pipefail
+
+# 代理：从环境变量读取（不再硬编码任何内网地址）。
+# 兼容 HTTP_PROXY / http_proxy 两种写法；都未设置时不导出代理变量（直连）。
+PROXY_URL="${HTTP_PROXY:-${http_proxy:-}}"
+if [ -n "$PROXY_URL" ]; then
+  export http_proxy="$PROXY_URL"
+  export https_proxy="${HTTPS_PROXY:-${https_proxy:-$PROXY_URL}}"
+  echo "ℹ️  使用代理: $PROXY_URL"
+else
+  echo "ℹ️  未设置 HTTP_PROXY，按直连处理（如需外网代理请先 export HTTP_PROXY=http://host:port）"
+fi
 # --- 配置区 ---
 # 修改成你的二进制文件名
 APP_NAME="hanime-dl"
@@ -60,7 +71,7 @@ echo "✅ Git 工作区干净，准备开始构建..."
 rm -rf $RELEASE_DIR
 mkdir -p $RELEASE_DIR
 
-# 4. 交叉编译
+# 4. 交叉编译（set -e 已保证任一步失败即中止，不再用 $? 只检查最后一条）
 echo "🛠️  正在为 Linux, Windows, macOS (amd64 + arm64) 交叉编译..."
 GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-linux-amd64" .
 GOOS=linux   GOARCH=arm64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-linux-arm64" .
@@ -68,11 +79,6 @@ GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAM
 GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-windows-arm64.exe" .
 GOOS=darwin  GOARCH=amd64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-macos-amd64" .
 GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o "${RELEASE_DIR}/${APP_NAME}-macos-arm64" .
-
-if [ $? -ne 0 ]; then
-    echo "❌ 编译失败。"
-    exit 1
-fi
 echo "✅ 编译成功！"
 
 # 5. 打包压缩
@@ -99,9 +105,7 @@ echo "✅ 打包完成！"
 # 6. 创建并推送 Git 标签
 echo "🔖 正在创建并推送 Git 标签: $VERSION"
 git tag -a "$VERSION" -m "Release $VERSION"
-git push origin "$VERSION"
-
-if [ $? -ne 0 ]; then
+if ! git push origin "$VERSION"; then
     echo "❌ 推送标签失败。请检查你的 Git 远程配置和权限。"
     exit 1
 fi
@@ -109,11 +113,9 @@ echo "✅ 标签已成功推送到远程仓库！"
 
 # 7. 创建 GitHub Release 并上传文件
 echo "🎉 正在创建 GitHub Release 并上传产物..."
-gh release create "$VERSION" ./${RELEASE_DIR}/* \
+if ! gh release create "$VERSION" ./${RELEASE_DIR}/* \
     --title "Release $VERSION" \
-    --generate-notes
-
-if [ $? -ne 0 ]; then
+    --generate-notes; then
     echo "❌ 创建 Release 失败。请检查 gh 是否已登录 (gh auth status) 并有足够权限。"
     exit 1
 fi

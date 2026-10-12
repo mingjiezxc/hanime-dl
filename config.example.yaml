@@ -1,0 +1,38 @@
+# hanime-dl 配置示例（config.example.yaml）
+#
+# 用法：复制为 config.yaml 后按需修改：
+#   cp config.example.yaml config.yaml
+#
+# 注意：
+#   1. config.yaml 属于「本机私有配置」，已被 .gitignore 忽略，不会被提交。
+#      程序首次运行且 config.yaml 不存在时，也会自动生成一份内容等价的默认配置。
+#   2. 本文件中的地址全部是通用占位值，请勿在此写入任何内网 / 私有地址。
+#   3. 本文件的正文部分与 config/config.go 的 DefaultConfigYAML 保持一致，
+#      修改其中一处时请同步另一处。
+
+# Chrome 远程调试 URL
+chromeRemoteURL: http://localhost:9222/json/version
+
+# 缓存目录
+CacheDir: ./cache
+
+# 下载目录
+DownDir: ./downloads
+
+# HTTP 代理（可选，留空表示直连）
+HttpProxy: http://proxy.example.com:8080
+
+# 最大并发下载线程数
+MaxDownloadWorkers: 3
+
+# 播放列表 ID 列表（字符串数组，可留空；写法：- "playlist-id-1"）
+ListCode: []
+
+# 单个视频 ID 列表（字符串数组，可留空；写法：- "video-id-1"）
+SingleCode: []
+
+# 下载后清除缓存
+ClearCache: true
+
+# 视频分辨率（如：1080p, 720p；未配置或未命中时回落最高分辨率）
+VideoResolution: 1080p

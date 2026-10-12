@@ -1,7 +1,6 @@
 package chrome
 
 import (
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -15,44 +14,69 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/chromedp/chromedp"
 )
 
 const (
-	MaxRetries        = 5
-	RetryInterval     = 5 * time.Second
+	// StartupCDPTimeout 探测「某个已知 CDP 端点是否可用」的总时间预算。
+	//
+	// 所有探测路径都以它为界：GetWebSocketDebuggerURL 与
+	// GetWebSocketDebuggerURLWithTimeout 都按 deadline 轮询，不再存在
+	// 「固定重试 5 次 × 5s 间隔」这种与调用方预算互相矛盾的上限 ——
+	// 旧实现单次调用最坏 25s+，却同时被 5s 的连接预算和 30s 的就绪循环包住，
+	// 语义自相矛盾（审计 P2-14）。
 	StartupCDPTimeout = 5 * time.Second
-	OpenPageTimeout   = 10 * time.Second
-	chromeWatchURL    = "https://hanime1.me/watch?v=%s"
-	playlistSelector  = `#video-playlist-wrapper a`
+	// OpenPageTimeout 通过 DevTools HTTP 端点打开页面的超时。
+	OpenPageTimeout = 10 * time.Second
+	// ChromeReadyTimeout 本地拉起 Chrome 后等待其 CDP 就绪的总预算。
+	ChromeReadyTimeout = 30 * time.Second
+	// cdpProbeTimeout 单次 HTTP 探测 CDP 端点的超时上限。
+	cdpProbeTimeout = 2 * time.Second
+	// cdpPollInterval CDP 就绪轮询的间隔。
+	cdpPollInterval = 500 * time.Millisecond
 )
 
-// Launcher Chrome 启动器
+// Launcher 记录一个由本进程拉起的 Chrome 实例，用于回收其进程与临时 profile 目录。
 type Launcher struct {
-	cmd *exec.Cmd
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	profileDir string
+	cleaned    bool
 }
 
-// GetWebSocketDebuggerURL 获取 Chrome WebSocket 调试 URL
+// 本进程拉起的本地 Chrome 注册表。
+//
+// 为什么需要它：StartLocalChrome 用 Setsid 让 Chrome 独立成进程组并常驻，本进程退出
+// 不会替它收尸。旧实现把 *Launcher 只存在 StartLocalChrome 的局部变量里，函数一返回
+// 实例即被丢弃 —— 结果是每次自动拉起都泄漏一个浏览器进程和一个
+// /tmp/chrome-profile-* 目录（审计 P2-13 指出的「真实进程泄漏」）。这里用一个受锁
+// 保护的注册表把「拉起」与「退出清理」连接起来，避免把 *Launcher 穿透到
+// EnsureChromeConnection / refreshWSURL 等所有可能隐式拉起 Chrome 的调用方。
+var (
+	launchersMu sync.Mutex
+	launchers   []*Launcher
+)
+
+// closeQuietly 关闭 c 并把失败记录到日志。
+//
+// errcheck 基线要求所有 Close 的错误都被显式处理；这里的关闭点即将随连接/进程结束
+// 而释放资源，失败不影响主流程，因此记日志而不上抛。
+func closeQuietly(c io.Closer, what string) {
+	if c == nil {
+		return
+	}
+	if err := c.Close(); err != nil {
+		log.Printf("closing %s failed: %v", what, err)
+	}
+}
+
+// GetWebSocketDebuggerURL 获取 Chrome WebSocket 调试 URL。
+//
+// 总预算为 StartupCDPTimeout：在该预算内按 cdpPollInterval 轮询，单次请求不超过
+// cdpProbeTimeout。调用方因此能确定「这一次探测最多花多久」。
 func GetWebSocketDebuggerURL(uri string) (string, error) {
-	var lastErr error
-
-	// 如果是 WebSocket URL，直接返回
-	if strings.HasPrefix(uri, "ws://") || strings.HasPrefix(uri, "wss://") {
-		return uri, nil
-	}
-
-	for i := 0; i < MaxRetries; i++ {
-		wsURL, err := fetchWebSocketDebuggerURL(uri, 10*time.Second)
-		if err == nil {
-			return wsURL, nil
-		}
-		lastErr = err
-		time.Sleep(RetryInterval)
-	}
-
-	return "", fmt.Errorf("failed after %d attempts, last error: %w", MaxRetries, lastErr)
+	return GetWebSocketDebuggerURLWithTimeout(uri, StartupCDPTimeout)
 }
 
 // GetWebSocketDebuggerURLWithTimeout 在限定时间内快速检查 CDP 端点
@@ -79,14 +103,14 @@ func GetWebSocketDebuggerURLWithTimeout(uri string, timeout time.Duration) (stri
 			break
 		}
 
-		requestTimeout := minDuration(2*time.Second, remaining)
+		requestTimeout := minDuration(cdpProbeTimeout, remaining)
 		wsURL, err := fetchWebSocketDebuggerURL(uri, requestTimeout)
 		if err == nil {
 			return wsURL, nil
 		}
 		lastErr = err
 
-		sleepFor := minDuration(500*time.Millisecond, time.Until(deadline))
+		sleepFor := minDuration(cdpPollInterval, time.Until(deadline))
 		if sleepFor > 0 {
 			time.Sleep(sleepFor)
 		}
@@ -126,9 +150,10 @@ func fetchWebSocketDebuggerURL(uri string, requestTimeout time.Duration) (string
 	if err != nil {
 		return "", fmt.Errorf("http client.Do failed: %w", err)
 	}
+	// defer 而非内联关闭：错误返回路径也必须释放连接（bodyclose 基线要求）。
+	defer closeQuietly(resp.Body, "CDP version response body")
 
 	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
 	if err != nil {
 		return "", fmt.Errorf("reading response body failed: %w", err)
 	}
@@ -203,13 +228,14 @@ func AutoDetectChromeWithTimeout(timeout time.Duration) string {
 		if err != nil {
 			continue
 		}
-		conn.Close()
+		closeQuietly(conn, fmt.Sprintf("probe connection to port %d", port))
 
 		var wsURL string
 		if deadline.IsZero() {
+			// 无总预算（AutoDetectChrome 的显式语义）：每个端口最多花 StartupCDPTimeout。
 			wsURL, err = GetWebSocketDebuggerURL(url)
 		} else {
-			wsURL, err = GetWebSocketDebuggerURLWithTimeout(url, minDuration(time.Second, time.Until(deadline)))
+			wsURL, err = GetWebSocketDebuggerURLWithTimeout(url, minDuration(cdpProbeTimeout, time.Until(deadline)))
 		}
 		if err == nil && wsURL != "" {
 			log.Printf("Found Chrome instance on port %d: %s", port, wsURL)
@@ -294,24 +320,25 @@ func OpenURL(wsURL, targetURL string, timeout time.Duration) error {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		fallbackReq, fallbackErr := http.NewRequest(http.MethodGet, devtoolsURL, http.NoBody)
-		if fallbackErr == nil {
-			resp, fallbackErr = client.Do(fallbackReq)
-			if fallbackErr == nil {
-				err = nil
-			} else {
-				err = fallbackErr
-			}
+		// 兼容旧版 Chrome：DevTools 的 /json/new 在部分版本只接受 GET。
+		fallbackReq, fbErr := http.NewRequest(http.MethodGet, devtoolsURL, http.NoBody)
+		if fbErr != nil {
+			return err
+		}
+		resp, err = client.Do(fallbackReq)
+		if err != nil {
+			return err
 		}
 	}
-	if resp != nil {
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			err = fmt.Errorf("devtools endpoint returned status %s", resp.Status)
-		}
+	defer closeQuietly(resp.Body, "devtools new tab response body")
+
+	if _, cerr := io.Copy(io.Discard, resp.Body); cerr != nil {
+		log.Printf("Failed to drain devtools response body: %v", cerr)
 	}
-	return err
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("devtools endpoint returned status %s", resp.Status)
+	}
+	return nil
 }
 
 // CreateTab 通过 DevTools HTTP 端点在已有浏览器中打开一个新的「标签页」（而非新窗口），
@@ -350,7 +377,7 @@ func CreateTab(wsURL, targetURL string, timeout time.Duration) (string, error) {
 			return "", err
 		}
 	}
-	defer resp.Body.Close()
+	defer closeQuietly(resp.Body, "new tab response body")
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -496,7 +523,7 @@ func StartLocalChrome() (string, error) {
 			debugPort = port
 			break
 		}
-		conn.Close()
+		closeQuietly(conn, fmt.Sprintf("port probe connection to %d", port))
 	}
 
 	if debugPort == 0 {
@@ -528,7 +555,7 @@ func StartLocalChrome() (string, error) {
 		args = append(args, "--no-sandbox")
 	}
 
-	launcher := &Launcher{}
+	launcher := &Launcher{profileDir: tempDir}
 	launcher.cmd = exec.Command(chromePath, args...)
 	launcher.cmd.Stdout = os.Stdout
 	launcher.cmd.Stderr = os.Stderr
@@ -536,72 +563,102 @@ func StartLocalChrome() (string, error) {
 	// 平台特定的进程管理
 	setProcessGroupAttr(launcher.cmd)
 
+	// 即将拉起新实例：先把此前由本进程拉起的实例回收掉。
+	// 能走到这里说明 AutoDetectChromeWithTimeout 在所有候选端口都没找到可用 CDP
+	// 端点，因此旧实例要么已退出、要么已不可用，回收是安全的；这同时把注册表长度
+	// 限制在 ~1，避免反复重连时进程与临时目录累积。
+	retireLaunchers()
+
 	if err := launcher.cmd.Start(); err != nil {
+		// 启动失败：临时 profile 目录没人用了，立即回收。
+		launcher.Cleanup()
 		return "", fmt.Errorf("failed to start Chrome: %w", err)
 	}
+	registerLauncher(launcher)
 
 	log.Printf("Chrome launched with PID %d, waiting for it to be ready...", launcher.cmd.Process.Pid)
 
-	// 等待 Chrome 启动
-	startTime := time.Now()
-	for time.Since(startTime) < 30*time.Second {
-		url := fmt.Sprintf("http://localhost:%d/json/version", debugPort)
-		wsURL, err := GetWebSocketDebuggerURL(url)
+	// 等待 Chrome 就绪：总预算 ChromeReadyTimeout，每次探测不超过 cdpProbeTimeout。
+	// 旧实现在这个 30s 循环里调用的是「固定重试 5 次 × 5s」的版本，单次调用就可能
+	// 花掉 25s+，导致整个循环最坏跑到 ~50s 甚至更久（审计 P2-14）。
+	deadline := time.Now().Add(ChromeReadyTimeout)
+	versionURL := fmt.Sprintf("http://localhost:%d/json/version", debugPort)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		wsURL, err := GetWebSocketDebuggerURLWithTimeout(versionURL, minDuration(cdpProbeTimeout, remaining))
 		if err == nil && wsURL != "" {
 			log.Printf("Chrome is ready! WebSocket URL: %s", wsURL)
 			return wsURL, nil
 		}
-		time.Sleep(1 * time.Second)
+		sleepFor := minDuration(cdpPollInterval, time.Until(deadline))
+		if sleepFor <= 0 {
+			break
+		}
+		time.Sleep(sleepFor)
 	}
 
-	return "", errors.New("Chrome failed to become ready within 30 seconds")
+	// 就绪失败：必须回收刚拉起的进程，否则又是一个失去引用的孤儿浏览器。
+	launcher.Cleanup()
+	return "", fmt.Errorf("chrome failed to become ready within %s", ChromeReadyTimeout)
 }
 
-// Cleanup 清理 Chrome 进程（跨平台）
+// registerLauncher 记录一个已成功拉起的 Chrome 实例。
+func registerLauncher(l *Launcher) {
+	launchersMu.Lock()
+	launchers = append(launchers, l)
+	launchersMu.Unlock()
+}
+
+// retireLaunchers 终止并移除注册表中全部由本进程拉起的 Chrome 实例。
+func retireLaunchers() {
+	launchersMu.Lock()
+	old := launchers
+	launchers = nil
+	launchersMu.Unlock()
+	for _, l := range old {
+		l.Cleanup()
+	}
+}
+
+// CleanupLaunchedChrome 终止本进程拉起的全部本地 Chrome 实例，并删除它们的临时
+// profile 目录。应在进程退出路径调用一次（main 的 defer）。
+//
+// 覆盖所有隐式拉起路径：main 启动阶段的 EnsureChromeConnectionDetailed、web 侧
+// refreshWSURL 调用的 EnsureChromeConnection、以及 StartLocalChrome 的重复调用。
+func CleanupLaunchedChrome() {
+	retireLaunchers()
+}
+
+// Cleanup 清理 Chrome 进程与其临时 profile 目录（跨平台）。
+//
+// 幂等且并发安全：同一个 Launcher 可能既在 StartLocalChrome 的失败路径上被清理，
+// 又在进程退出时被 CleanupLaunchedChrome 通过注册表再次清理（多个 worker 并发
+// refreshWSURL 时也可能并发触发），因此这里用锁 + 一次性标志保证真正的回收只做一次。
 func (l *Launcher) Cleanup() {
-	if l.cmd != nil && l.cmd.Process != nil {
+	if l == nil {
+		return
+	}
+
+	l.mu.Lock()
+	if l.cleaned {
+		l.mu.Unlock()
+		return
+	}
+	l.cleaned = true
+	cmd, profileDir := l.cmd, l.profileDir
+	l.profileDir = ""
+	l.mu.Unlock()
+
+	if cmd != nil && cmd.Process != nil {
 		log.Println("Cleaning up Chrome process...")
-		cleanupProcess(l.cmd)
+		cleanupProcess(cmd)
 	}
-}
-
-// ExtractPlaylist 提取播放列表
-func ExtractPlaylist(wsURL, videoID string) ([]string, error) {
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 300*time.Second)
-	defer cancel1()
-
-	allocatorContext, cancelAllocator := chromedp.NewRemoteAllocator(ctx1, wsURL, chromedp.NoModifyURL)
-	defer cancelAllocator()
-
-	ctx, cancelCtx := chromedp.NewContext(allocatorContext)
-	defer cancelCtx()
-
-	var links []map[string]string
-	err := chromedp.Run(ctx,
-		chromedp.Navigate(fmt.Sprintf(chromeWatchURL, videoID)),
-		chromedp.Sleep(5*time.Second),
-		chromedp.AttributesAll(playlistSelector, &links, chromedp.ByQueryAll),
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	var result []string
-	idMap := make(map[string]int)
-	for _, link := range links {
-		if v, ok := link["class"]; ok && v == "overlay" {
-			if href, okHref := link["href"]; okHref {
-				parts := strings.Split(href, "=")
-				if len(parts) > 1 {
-					idMap[parts[1]] = 0
-				}
-			}
+	if profileDir != "" {
+		if err := os.RemoveAll(profileDir); err != nil {
+			log.Printf("Failed to remove Chrome temp profile %s: %v", profileDir, err)
 		}
 	}
-	for k := range idMap {
-		result = append(result, k)
-	}
-
-	return result, nil
 }

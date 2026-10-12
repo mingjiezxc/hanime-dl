@@ -2,7 +2,10 @@
 
 package chrome
 
-import "os/exec"
+import (
+	"log"
+	"os/exec"
+)
 
 // setProcessGroupAttr Windows 下无需设置进程组属性
 func setProcessGroupAttr(cmd *exec.Cmd) {
@@ -11,7 +14,15 @@ func setProcessGroupAttr(cmd *exec.Cmd) {
 
 // cleanupProcess 终止 Windows 进程
 func cleanupProcess(cmd *exec.Cmd) {
-	if cmd != nil && cmd.Process != nil {
-		cmd.Process.Kill()
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	killProcess(cmd)
+}
+
+// killProcess 终止单个进程
+func killProcess(cmd *exec.Cmd) {
+	if err := cmd.Process.Kill(); err != nil {
+		log.Printf("Failed to kill Chrome process %d: %v", cmd.Process.Pid, err)
 	}
 }

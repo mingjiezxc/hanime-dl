@@ -1,3 +1,10 @@
+> **Status note (2026-10-12):** This is a historical snapshot. It was written before the
+> modular refactor, so some symbols it names no longer exist (e.g. `ChromedpGetList`,
+> `DownloadFileWithRetry`, and the "all logic in `main.go`" claim — the code is now split
+> across `main.go`, `scraper/`, `downloader/`, `chrome/`, `config/` and `web/`).
+> The configuration values in section 4 have been replaced with the generic placeholders
+> used by `config.example.yaml`. Refer to `README.md` for current architecture.
+
 ## Codewiki: `hanime-dl` Project Summary
 
 ### 1. Project Overview
@@ -35,14 +42,17 @@ The application uses a **Producer-Consumer** pattern:
 | **`DownloadFile(...)`** | Implements the core resumable HTTP download logic, including progress logging and proxy support. |
 | **`ubuntu-desktop/`** | Contains Docker files to easily spin up a headless Chrome instance with remote debugging, which is a prerequisite for the application. |
 
-### 4. Configuration Details (from current `config.yaml`)
+### 4. Configuration Details
 
-| Setting | Value | Description |
+Values below are the generic defaults shipped in `config.example.yaml`; a real deployment
+overrides them in a local, untracked `config.yaml`.
+
+| Setting | Example value | Description |
 | :--- | :--- | :--- |
-| `chromeRemoteURL` | `http://192.168.188.103:9222/json/version` | The current target for the Chrome DevTools connection. |
+| `chromeRemoteURL` | `http://localhost:9222/json/version` | The target Chrome DevTools endpoint. |
 | `CacheDir` | `./cache` | Local directory for storing metadata caches (`list_*.json`, `info_*.json`). |
-| `DownDir` | `/mnt/disk3/video/on/` | The ultimate destination directory for downloaded files. |
-| `HttpProxy` | `http://192.168.188.1:3128` | Configured HTTP proxy for downloading media files. |
-| `MaxDownloadWorkers` | `2` | Number of parallel downloads allowed. |
-| `ListCode` | `[158032, 143645, ...]` | List of playlist IDs to process. |
-| `SingleCode` | `[143648]` | List of individual video IDs to process. |
+| `DownDir` | `./downloads` | Destination directory for downloaded files. |
+| `HttpProxy` | `http://proxy.example.com:8080` | Optional HTTP proxy for downloading media files. |
+| `MaxDownloadWorkers` | `3` | Number of parallel downloads allowed. |
+| `ListCode` | `[]` | List of playlist IDs to process. |
+| `SingleCode` | `[]` | List of individual video IDs to process. |

@@ -1,6 +1,16 @@
+# 构建产物
 hanime-dl
 release
+
+# 运行时数据
 cache
 downloads
-dev
 download
+dev
+
+# 本机私有配置（示例见 config.example.yaml；
+# 注意 config/ 是源码目录，不能忽略）
+config.yaml
+
+# 本地构建缓存与工具（GOPATH / GOCACHE / golangci-lint 缓存，体积很大）
+.dbg/

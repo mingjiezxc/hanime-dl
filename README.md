@@ -31,6 +31,25 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 - 🐛 **目录自动创建** - 修复下载时目标父目录（如 `download/<影片名>/`）不存在导致临时文件创建失败的问题，现会在写入前自动 `MkdirAll` 父目录
 - 🐛 **新标签页代替新窗口** - 修复 chromedp 在远程浏览器下每次抓取都会打开「新窗口」的问题，改为在已有浏览器中打开「新标签页」（新增 `chrome.CreateTab()`，`scraper` 通过 `WithTargetID` 附着，任务结束自动关闭标签页）
 
+## 🛠️ 未发布：审计整改 (unreleased)
+
+针对一次完整的代码审计做了一批修复与工程基线建设。**尚未打标签发布**，
+各项改动分布在 `downloader/`、`scraper/`、`web/`、`chrome/`、`main.go` 与仓库根目录。
+
+- 🔒 **下载落盘完整性** - 下载字节数与 `Content-Length` 不一致时不再把残缺临时文件改名为成品，
+  并区分「总长未知」与「0 字节」的进度语义
+- ⏱️ **超时与取消** - 去掉实际等于无超时的超长 `Timeout`，改为分段超时（连接 / TLS / 响应头）＋
+  「字节长时间无增长」的空闲读超时
+- 🧵 **并发安全** - 同一路径的并发下载串行化，避免并发写同一临时文件导致文件损坏
+- 🐛 **错误分类** - 按类型化状态码（410 / 416）分支，不再用 `strings.Contains(err.Error(), "410")` 猜状态码
+- 🖼️ **封面与抓取** - 高清封面搜索不再硬编码单一分类；抽取下载页解析与分辨率选择的重复实现，
+  失败时明确回落并打 WARN
+- 🧹 **配置卫生** - `config.yaml` 示例化为 `config.example.yaml`，本机私有配置改为 gitignore；
+  移除从未被读取的无效配置项
+- 🧪 **测试** - 为 `downloader/`、`scraper/` 等模块补齐**离线**单元测试（`httptest` / 纯函数，不依赖 Chrome 与外网）
+- 🧰 **工程基线** - 新增 `Makefile`（`build` / `vet` / `fmt` / `fmt-check` / `lint` / `test` / `all`）
+  与 `.golangci.yml`（golangci-lint v2.14.0），并记录只读 `GOCACHE` 这一环境陷阱
+
 ## 功能特性
 
 - 🎬 支持单个视频下载
@@ -45,27 +64,35 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 
 ```
 hanime-dl/
-├── main.go              # 主程序入口
+├── main.go                        # 主程序入口
 ├── config/
-│   └── config.go        # 配置管理模块
+│   └── config.go                  # 配置管理模块
 ├── chrome/
-│   └── chrome.go        # Chrome 浏览器管理模块
+│   └── chrome.go                  # Chrome 浏览器管理模块
 ├── scraper/
-│   └── scraper.go       # 网页抓取模块
+│   ├── scraper.go                 # 网页抓取模块
+│   └── scraper_test.go            # 抓取模块纯函数测试（离线）
 ├── downloader/
-│   └── downloader.go    # 文件下载模块
+│   ├── downloader.go              # 文件下载模块
+│   └── downloader_test.go         # 下载模块测试（离线，httptest）
 ├── web/
-│   └── web_server.go    # Web 服务器模块
-├── config.yaml          # 配置文件
-├── go.mod               # Go 模块定义
-└── README.md            # 项目说明
+│   └── web_server.go              # Web 服务器模块
+├── config.example.yaml            # 配置示例（提交进仓库）
+├── config.yaml                    # 本机实际配置（首次运行自动生成，已被 .gitignore 忽略）
+├── Makefile                       # 构建 / 检查 / 测试入口
+├── .golangci.yml                  # golangci-lint 配置（v2 schema）
+├── go.mod                         # Go 模块定义
+└── README.md                      # 项目说明
 ```
+
+> `config.yaml` **不随仓库分发**：它属于本机私有配置（可能含内网地址与代理），已被 `.gitignore` 忽略。
+> 首次运行且该文件不存在时程序会自动生成一份默认配置；需要手写时请从 `config.example.yaml` 复制。
 
 ### 模块说明
 
 | 模块 | 功能 | 主要函数 |
 |------|------|----------|
-| `config` | 配置管理 | `Load()`, `MustLoad()` |
+| `config` | 配置管理 | `LoadOrCreate()`, `MustLoadOrCreate()` |
 | `chrome` | Chrome 浏览器管理 | `GetWebSocketDebuggerURL()`, `AutoDetectChrome()`, `StartLocalChrome()`, `CreateTab()` |
 | `scraper` | 网页抓取 | `GetPlaylist()`, `ResolveVideoInfo()`, `RefreshVideoDataURL()` |
 | `downloader` | 文件下载 | `DownloadFile()`, `DownloadWithRetry()` |
@@ -75,7 +102,7 @@ hanime-dl/
 
 ### 前置要求
 
-- Go 1.19+
+- Go 1.24+（`go.mod` 声明的版本）
 - Google Chrome 或 Chromium 浏览器
 
 ### 编译
@@ -92,9 +119,56 @@ go mod download
 go build -o hanime-dl .
 ```
 
+也可以直接用 Makefile：
+
+```bash
+make build      # go build ./...
+make test       # go test -race ./...
+make lint       # golangci-lint run ./...
+make fmt-check  # 检查 gofmt 是否干净
+make all        # fmt-check + vet + build + test + lint
+```
+
+## ⚠️ 环境陷阱：Go 构建缓存只读（GOCACHE）
+
+某些环境（例如本机的 `/root/.cache/go-build`）下，默认 Go 构建缓存目录是**只读**的。
+此时任何 `go build` / `go vet` / `go test` 都会以如下形式失败，看起来像是代码问题，
+实际只是缓存不可写：
+
+```
+go: creating work dir: mkdir /root/.cache/go-build/...: read-only file system
+```
+
+解决办法是把 `GOCACHE` 重定向到可写目录（`.dbg/` 已加入 `.gitignore`）：
+
+```bash
+export GOCACHE=$PWD/.dbg/gocache
+export GOPATH=$PWD/.dbg/gopath          # 可选；依赖已就位时非必需
+export GOLANGCI_LINT_CACHE=$PWD/.dbg/golangci-cache   # 仅 golangci-lint 需要
+```
+
+上面的 `Makefile` 已经用 `?=` 为 `GOCACHE` / `GOLANGCI_LINT_CACHE` 设好了仓库内默认值，
+所以 `make build` / `make test` / `make lint` 无需先手工 export 即可运行；
+若你已导出同名变量，则以你的值为准。
+
+其他说明：
+
+- `make fmt` / `make fmt-check` 只处理 **git 认得的** `.go` 文件，
+  不会递归进入 `.dbg/`（那里有上万个第三方源码文件）。**请勿手写 `gofmt -w .`。**
+- 本机依赖模块已下载在 `.dbg/gopath/pkg/mod`，正常构建**不需要联网**，也不需要设置 `GOPROXY` / `http_proxy`。
+
 ## 配置
 
-编辑 `config.yaml` 文件：
+配置文件的优先级（默认路径 `config.yaml`，可用 `-config` 指定）：
+
+1. 已存在 `config.yaml` → 直接读取；
+2. 不存在 → 程序自动写入一份等价于 `config.example.yaml` 正文的默认配置后再读取。
+
+手写配置时请从示例复制，**不要**在 `config.example.yaml` 里写任何内网 / 私有地址：
+
+```bash
+cp config.example.yaml config.yaml
+```
 
 ```yaml
 # Chrome 远程调试 URL
@@ -106,45 +180,46 @@ CacheDir: ./cache
 # 下载目录
 DownDir: ./downloads
 
-# HTTP 代理（可选）
+# HTTP 代理（可选，留空表示直连）
 HttpProxy: http://proxy.example.com:8080
-
-# 是否优先尝试直接下载
-DirectDownloadFirst: true
 
 # 最大并发下载线程数
 MaxDownloadWorkers: 3
 
-# 播放列表 ID 列表
-ListCode:
-  - "playlist-id-1"
-  - "playlist-id-2"
+# 播放列表 ID 列表（字符串数组，可留空；写法：- "playlist-id-1"）
+ListCode: []
 
-# 单个视频 ID 列表
-SingleCode:
-  - "video-id-1"
+# 单个视频 ID 列表（字符串数组，可留空；写法：- "video-id-1"）
+SingleCode: []
 
 # 下载后清除缓存
 ClearCache: true
 
-# 视频分辨率（如：1080p, 720p）
+# 视频分辨率（如：1080p, 720p；未配置或未命中时回落最高分辨率）
 VideoResolution: 1080p
 ```
 
 ### 配置项说明
 
-| 配置项 | 类型 | 说明 |
-|--------|------|------|
-| `chromeRemoteURL` | string | Chrome DevTools WebSocket URL |
-| `CacheDir` | string | 缓存目录路径 |
-| `DownDir` | string | 视频下载目录路径 |
-| `HttpProxy` | string | HTTP 代理地址（可选） |
-| `DirectDownloadFirst` | bool | 是否优先尝试直接下载 |
-| `MaxDownloadWorkers` | int | 并发下载线程数 |
-| `ListCode` | []string | 播放列表 ID 列表 |
-| `SingleCode` | []string | 单个视频 ID 列表 |
-| `ClearCache` | bool | 下载后是否清除缓存 |
-| `VideoResolution` | string | 目标视频分辨率 |
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `chromeRemoteURL` | string | `http://localhost:9222/json/version` | Chrome DevTools 调试地址 |
+| `CacheDir` | string | `./cache` | 缓存目录路径 |
+| `DownDir` | string | `./downloads` | 视频下载目录路径 |
+| `HttpProxy` | string | `http://proxy.example.com:8080` | HTTP 代理地址（留空＝直连） |
+| `MaxDownloadWorkers` | int | `3` | 并发下载线程数 |
+| `ListCode` | []string | `[]` | 播放列表 ID 列表 |
+| `SingleCode` | []string | `[]` | 单个视频 ID 列表 |
+| `ClearCache` | bool | `true` | 单个视频下载成功后是否删除其 `cache/info_<id>.json`（列表缓存另按列表进度清理） |
+| `VideoResolution` | string | `1080p` | 目标分辨率；未配置或未命中时回落最高分辨率 |
+
+> **关于默认值与字段名大小写**
+>
+> - 默认值集中定义在 `config/config.go` 的常量中（`DefaultDownDir` 等），模板与常量不会漂移。
+> - **下载目录默认值是 `./downloads`**。历史版本中 `web` 包的内置兜底值曾写作 `./download`，
+>   二者不一致；现已以 `config/config.go` 的常量为唯一权威值，其他位置应引用它。
+> - YAML 键名**区分大小写**（`yaml.v3` 在显式 tag 下按精确串匹配），且**写错大小写不会报错，只会被静默忽略**
+>   （字段留空/零值）。请严格照抄上表中的写法，尤其是 `chromeRemoteURL`（首字母小写）。
 
 ## 使用方法
 
@@ -282,9 +357,9 @@ google-chrome --remote-debugging-port=9222
 ### Q: 下载速度慢
 
 **A**: 
-1. 检查代理配置是否正确
-2. 增加 `MaxDownloadWorkers` 值
-3. 尝试 `DirectDownloadFirst: false`
+1. 检查代理配置是否正确（`HttpProxy`，留空表示直连）
+2. 适当增加 `MaxDownloadWorkers` 值（注意不要把带宽和服务端限流打满）
+3. 若目标分辨率较高，可尝试把 `VideoResolution` 调低（如 `720p`）
 
 ### Q: 视频分辨率不符合要求
 
@@ -304,9 +379,18 @@ google-chrome --remote-debugging-port=9222
 
 ### 代码规范
 
-- 使用 Go 标准格式化：`go fmt ./...`
-- 运行静态检查：`go vet ./...`
-- 添加单元测试（未来计划）
+- 格式化：`make fmt`（等价于 `gofmt -l -w`，仅作用于 git 跟踪/新增的 `.go` 文件）
+- 格式检查：`make fmt-check`
+- 静态检查：`make vet`（`go vet ./...`）
+- Lint：`make lint`（`golangci-lint run ./...`，配置见 `.golangci.yml`，基于 golangci-lint **v2.14.0** 的 v2 schema）
+- 测试：`make test`（`go test -race ./...`）
+- 一次跑完：`make all`（`fmt-check` + `vet` + `build` + `test` + `lint`）
+
+写测试时请保持**离线**：不得依赖 Chrome、不得访问外网。
+现有 `downloader/downloader_test.go`（`httptest.Server`）与 `scraper/scraper_test.go`（纯函数）可作参考。
+
+> 提示：若 `make lint` 报找不到 golangci-lint，可设置
+> `export PATH=$PWD/.dbg/gopath/bin:$PATH`（Makefile 默认也会尝试该路径）。
 
 ## 许可证
 
@@ -345,7 +429,7 @@ MIT License
 #### Quick Start
 
 **Prerequisites**
-- Go 1.19+
+- Go 1.24+ (as declared in `go.mod`)
 - Google Chrome or Chromium browser
 
 **Build**
@@ -361,17 +445,37 @@ go mod download
 go build -o hanime-dl .
 ```
 
+Or just use the Makefile: `make build`, `make test`, `make lint`, `make all`.
+
+> **Environment gotcha — read-only Go build cache.** On hosts where the default
+> `GOCACHE` (`/root/.cache/go-build`) is read-only, every `go build` / `go vet` / `go test`
+> fails with `read-only file system`. Redirect it before running anything:
+> ```bash
+> export GOCACHE=$PWD/.dbg/gocache
+> export GOLANGCI_LINT_CACHE=$PWD/.dbg/golangci-cache
+> ```
+> The `Makefile` already defaults both to `.dbg/` (gitignored), so `make ...` works as-is.
+
 **Configuration**
-Edit `config.yaml`:
+`config.yaml` is **not** shipped in the repository — it is machine-local (it may contain
+private addresses) and is gitignored. Copy the example, or let the program generate a
+default one on first run:
+```bash
+cp config.example.yaml config.yaml
+```
 ```yaml
 chromeRemoteURL: http://localhost:9222/json/version
 CacheDir: ./cache
 DownDir: ./downloads
 HttpProxy: http://proxy.example.com:8080
-DirectDownloadFirst: true
 MaxDownloadWorkers: 3
+ListCode: []
+SingleCode: []
+ClearCache: true
 VideoResolution: 1080p
 ```
+YAML keys are **case-sensitive** and a misspelled key is silently ignored (the field just
+stays empty), so copy the spellings exactly — especially `chromeRemoteURL`.
 
 **Chrome Setup**
 ```bash
@@ -406,6 +510,11 @@ Access `http://localhost:8080` for:
 - 📊 Real-time download status
 
 #### Releases
+- **unreleased**: Code-audit remediation — download integrity (byte-count validation), segmented/idle
+  timeouts, per-path download mutex, typed HTTP error classification, scraper de-duplication + WARN
+  fallbacks, offline unit tests, `Makefile` + `.golangci.yml` baseline, `config.yaml` → `config.example.yaml`
+  (machine-local config is now gitignored), removal of a never-read download-mode setting that was
+  plumbed through the whole stack but never actually consulted
 - **v0.4.6**: Bug fixes - auto-create download dirs, open new tab instead of new window (`CreateTab`)
 - **v0.4.1**: Modular refactoring, Web interface added
 - **v0.4.0**: Initial modular architecture
