@@ -492,6 +492,43 @@
         // API 基础地址
         const API_BASE = '';
 
+        // --- API 访问令牌 ---
+        //
+        // 后端 config.yaml 里设置 apiToken 后，所有 /api/* 都要求
+        // `Authorization: Bearer <token>`。面板必须能带上它，否则一开鉴权就把自己挡住。
+        // 令牌存在 localStorage 而不是写进 HTML：页面是 //go:embed 进二进制的静态资源，
+        // 不能把凭据编进产物里。首次遇到 401 时提示输入一次，之后复用。
+        function apiToken() {
+            try {
+                return localStorage.getItem('hanimeApiToken') || '';
+            } catch (e) {
+                // 隐私模式下 localStorage 可能不可用：退化为「不带令牌」，
+                // 由 401 分支继续提示用户，而不是直接抛错让页面失效。
+                return '';
+            }
+        }
+
+        async function apiFetch(path, options) {
+            const opts = Object.assign({}, options);
+            const token = apiToken();
+            if (token) {
+                opts.headers = Object.assign({}, opts.headers, { 'Authorization': 'Bearer ' + token });
+            }
+            const response = await fetch(API_BASE + path, opts);
+            if (response.status === 401) {
+                const input = window.prompt('该服务已启用 API 令牌（config.yaml 的 apiToken），请输入令牌：', token);
+                if (input !== null && input.trim() !== '') {
+                    try {
+                        localStorage.setItem('hanimeApiToken', input.trim());
+                    } catch (e) {
+                        // 存不下就只用于本次请求：至少当前操作能成功。
+                    }
+                    return apiFetch(path, options);
+                }
+            }
+            return response;
+        }
+
         // 切换标签页
         document.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', () => {
@@ -526,7 +563,7 @@
             }
 
             try {
-                const response = await fetch(`${API_BASE}/api/submit`, {
+                const response = await apiFetch('/api/submit', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -561,7 +598,7 @@
             }
 
             try {
-                const response = await fetch(`${API_BASE}/api/submit`, {
+                const response = await apiFetch('/api/submit', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -588,7 +625,7 @@
         // 刷新任务列表
         async function refreshTasks() {
             try {
-                const response = await fetch(`${API_BASE}/api/tasks`);
+                const response = await apiFetch('/api/tasks');
                 if (!response.ok) throw new Error('Failed to fetch tasks');
                 
                 const tasks = await response.json();
@@ -600,6 +637,26 @@
         }
 
         // 渲染任务列表
+        //
+        // 转义是必须的：下面整段是 innerHTML 拼接，而 title / error_message /
+        // video_id / list_id / id 全部来自服务端，其中 video_id 与 list_id 直接来自
+        // 请求体、error_message 会回显服务端错误串。旧实现把它们原样插进 HTML，
+        // 于是「提交一个含标签的 video_id」就等于在面板里种下一段脚本；
+        // 叠加 API 曾无条件返回 Access-Control-Allow-Origin: *，
+        // 用户浏览器里任意网页都能跨源写入这条任务并在 5 秒轮询后同源执行。
+        // 现在后端已按白名单校验 ID 且默认不再开跨源，前端这层转义是第二道防线。
+        function escapeHtml(value) {
+            if (value === null || value === undefined) {
+                return '';
+            }
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
         function renderTasks(tasks) {
             const container = document.getElementById('task-list');
             
@@ -620,17 +677,17 @@
 
             container.innerHTML = tasks.map(task => {
                 const progress = task.progress || 0;
-                const statusClass = task.status;
-                const typeClass = task.type;
+                const statusClass = escapeHtml(task.status);
+                const typeClass = escapeHtml(task.type);
                 
                 return `
                     <div class="task-item ${statusClass} ${statusClass === 'downloading' ? 'downloading' : ''}">
                         <div class="task-header">
                             <div>
                                 <span class="task-type ${typeClass}">${task.type === 'single' ? '单个视频' : '播放列表'}</span>
-                                <span class="task-status ${statusClass}">${getStatusText(task.status)}</span>
+                                <span class="task-status ${statusClass}">${escapeHtml(getStatusText(task.status))}</span>
                             </div>
-                            <div class="task-title">${task.title || task.video_id || task.list_id}</div>
+                            <div class="task-title">${escapeHtml(task.title || task.video_id || task.list_id)}</div>
                         </div>
                         
                         <div class="progress-bar">
@@ -640,18 +697,18 @@
                         <div class="task-info">
                             <div class="task-info-item">
                                 <div class="task-info-label">任务 ID</div>
-                                <div class="task-info-value" style="font-size: 12px;">${task.id}</div>
+                                <div class="task-info-value" style="font-size: 12px;">${escapeHtml(task.id)}</div>
                             </div>
                             ${task.video_id ? `
                             <div class="task-info-item">
                                 <div class="task-info-label">视频 ID</div>
-                                <div class="task-info-value">${task.video_id}</div>
+                                <div class="task-info-value">${escapeHtml(task.video_id)}</div>
                             </div>
                             ` : ''}
                             ${task.list_id ? `
                             <div class="task-info-item">
                                 <div class="task-info-label">播放列表 ID</div>
-                                <div class="task-info-value">${task.list_id}</div>
+                                <div class="task-info-value">${escapeHtml(task.list_id)}</div>
                             </div>
                             ` : ''}
                             <div class="task-info-item">
@@ -680,7 +737,7 @@
                         
                         ${task.error_message ? `
                         <div class="alert alert-error" style="margin-top: 15px;">
-                            ❌ ${task.error_message}
+                            ❌ ${escapeHtml(task.error_message)}
                         </div>
                         ` : ''}
                     </div>

@@ -36,3 +36,14 @@ ClearCache: true
 
 # 视频分辨率（如：1080p, 720p；未配置或未命中时回落最高分辨率）
 VideoResolution: 1080p
+
+# 允许 CDP 端点使用自签名证书（跳过证书校验）。默认 false。
+# 仅在确实使用自签名远程 Chrome 时打开；打开后中间人可伪造调试端点。
+chromeInsecureTLS: false
+
+# Web API 访问令牌。留空 = 不启用鉴权（仅适合本机单人使用）。
+# 非空时所有 /api/* 请求必须带 `Authorization: Bearer <token>`。
+apiToken: ""
+
+# 允许跨源调用 API 的来源（如 http://localhost:3000）。留空 = 同源策略，不发 CORS 头。
+apiAllowOrigin: ""

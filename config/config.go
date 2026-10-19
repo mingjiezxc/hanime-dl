@@ -29,12 +29,27 @@ const (
 	DefaultClearCache = true
 	// DefaultVideoResolution 目标分辨率；未配置或未命中时由下载侧回落最高分辨率。
 	DefaultVideoResolution = "1080p"
+	// DefaultChromeInsecureTLS 是否允许 CDP 端点使用自签名证书。
+	// 默认 false：跳过证书校验会让中间人伪造「Chrome 调试端点」并接管 DevTools，
+	// 只有确实使用自签名端点时才应显式打开。
+	DefaultChromeInsecureTLS = false
+	// DefaultAPIToken Web API 的访问令牌。默认空 = 不启用鉴权（本机单人使用的形态）。
+	// 一旦这个服务可能被同网段其它设备访问到，就应该设置一个非空 token。
+	DefaultAPIToken = ""
+	// DefaultAPIAllowOrigin 允许跨源调用 API 的来源。默认空 = 不设 CORS 头（同源策略）。
+	// 历史实现无条件返回 `Access-Control-Allow-Origin: *`，
+	// 于是用户浏览器里任意网页都能跨源写这个服务的任务队列。
+	DefaultAPIAllowOrigin = ""
 )
 
 // DefaultConfigYAML 默认配置模板（对齐 README 与 config.example.yaml 的通用占位值）。
 // 当 config.yaml 缺失时，LoadOrCreate 会将本内容落盘为默认配置文件。
 // 内容由上面的默认常量拼装，因此常量与模板不会各自漂移；不含任何私有网络地址。
 // 修改本模板时，请同步更新仓库根目录的 config.example.yaml（其正文应与本模板一致）。
+//
+// 新增的三个安全相关项默认都是「最保守」的取值：不跳过证书校验、不启用跨源、
+// 不鉴权（鉴权默认关闭是为了不破坏本机既有用法，而不是因为它安全——
+// README 的「安全与暴露方式」一节说明了什么时候必须打开）。
 var DefaultConfigYAML = fmt.Sprintf(`# Chrome 远程调试 URL
 chromeRemoteURL: %s
 
@@ -61,8 +76,20 @@ ClearCache: %t
 
 # 视频分辨率（如：1080p, 720p；未配置或未命中时回落最高分辨率）
 VideoResolution: %s
+
+# 允许 CDP 端点使用自签名证书（跳过证书校验）。默认 false。
+# 仅在确实使用自签名远程 Chrome 时打开；打开后中间人可伪造调试端点。
+chromeInsecureTLS: %t
+
+# Web API 访问令牌。留空 = 不启用鉴权（仅适合本机单人使用）。
+# 非空时所有 /api/* 请求必须带 Authorization: Bearer <token> 头。
+apiToken: "%s"
+
+# 允许跨源调用 API 的来源（如 http://localhost:3000）。留空 = 同源策略，不发 CORS 头。
+apiAllowOrigin: "%s"
 `, DefaultChromeRemoteURL, DefaultCacheDir, DefaultDownDir, DefaultHTTPProxy,
-	DefaultMaxDownloadWorkers, DefaultClearCache, DefaultVideoResolution)
+	DefaultMaxDownloadWorkers, DefaultClearCache, DefaultVideoResolution,
+	DefaultChromeInsecureTLS, DefaultAPIToken, DefaultAPIAllowOrigin)
 
 // Config 应用程序配置。
 // 字段的 yaml tag 使用与 config.example.yaml / DefaultConfigYAML 完全一致的大小写写法，
@@ -77,6 +104,12 @@ type Config struct {
 	SingleCode         []string `yaml:"SingleCode"`
 	ClearCache         bool     `yaml:"ClearCache"`
 	VideoResolution    string   `yaml:"VideoResolution"`
+	// ChromeInsecureTLS 允许 CDP 端点使用自签名证书（跳过证书校验）。默认 false。
+	ChromeInsecureTLS bool `yaml:"chromeInsecureTLS"`
+	// APIToken 非空时，Web API 要求 `Authorization: Bearer <token>`。默认空 = 不鉴权。
+	APIToken string `yaml:"apiToken"`
+	// APIAllowOrigin 需要跨源调用 API 时的显式来源。默认空 = 不发 CORS 头。
+	APIAllowOrigin string `yaml:"apiAllowOrigin"`
 }
 
 // Load 从 YAML 文件加载配置。

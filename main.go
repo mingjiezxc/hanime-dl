@@ -22,12 +22,22 @@ import (
 	"hanime-dl/chrome"
 	"hanime-dl/config"
 	"hanime-dl/downloader"
+	"hanime-dl/internal/idutil"
 	"hanime-dl/scraper"
 	"hanime-dl/web"
 )
 
 //go:embed web/*
 var embeddedWebFS embed.FS
+
+// version 由发布脚本用 -ldflags "-X main.version=vX.Y.Z" 注入。
+//
+// 为什么需要它：此前六个平台的产物里没有任何版本信息，出问题时无法确认
+// 用户手上跑的到底是哪一个二进制。默认值 "dev" 同时标记「本地裸 build，非发布产物」。
+var version = "dev"
+
+// commit 可选注入，用于排查时定位具体提交。
+var commit = "none"
 
 // VideoTask 下载任务
 type VideoTask struct {
@@ -133,6 +143,24 @@ func (a *taskQueueAdder) has(videoID string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.seen[videoID]
+}
+
+// validID 校验 ID 形状，不合法时打 WARN 并返回 false。
+//
+// 为什么 CLI 侧也要判（web 侧已有同一道校验）：这些 ID 会被拼进磁盘路径
+// —— cache/info_<id>.json、cache/list_<id>.json —— 而未校验的值经
+// filepath.Join 的 Clean 可以逃出缓存目录，把「写缓存」与「清缓存」变成
+// 任意路径写/删（复现见 internal/idutil 的测试）。
+//
+// 关键是播放列表里的视频 ID 是**从网页抓回来的**，属于不可信输入；
+// config.yaml 里的 ID 虽然是用户手写，也可能打错成带斜杠的形状。
+// scraper 侧同样有这道校验作为纵深防御，这里先挡住可以避免无谓的浏览器往返。
+func validID(kind, id string) bool {
+	if err := idutil.Validate(id); err != nil {
+		log.Printf("WARN: 跳过非法 %s ID：%v", kind, err)
+		return false
+	}
+	return true
 }
 
 // resolveAndQueue 解析一个任务并把结果送入下载队列。
@@ -259,7 +287,15 @@ func run() error {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	webMode := flag.Bool("web", false, "Start web server instead of CLI mode")
 	webAddr := flag.String("web-addr", ":8080", "Web server address")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	// -version 必须在读配置之前处理：查版本不该要求工作目录里有一份可用配置，
+	// 也不该顺带创建 config.yaml。
+	if *versionFlag {
+		fmt.Printf("hanime-dl %s (commit %s)\n", version, commit)
+		return nil
+	}
 
 	// 进程退出时回收本次启动过程中拉起的本地 Chrome（进程组 + 临时 profile 目录）。
 	// 少了这一步，StartLocalChrome / refreshWSURL 拉起的浏览器进程会一直留在宿主上
@@ -270,6 +306,7 @@ func run() error {
 	if created {
 		log.Printf("Config not found at %s, generated default config. Please review and edit it as needed.", *configPath)
 	}
+	log.Printf("hanime-dl %s (commit %s) starting", version, commit)
 	// 注意：不再无条件覆盖 cfg.ClearCache —— 配置文件里显式写 false 必须生效
 	// （审计 P3-15）。默认值语义由 config 侧决定。
 
@@ -290,6 +327,14 @@ func logChromeHelp() {
 	log.Println("  chromeRemoteURL: http://your-chrome-host:9222/json/version")
 }
 
+// chromeProbeOptions 把配置里的 TLS 开关翻译成 chrome 包的探测选项。
+//
+// 默认（cfg.ChromeInsecureTLS == false）保持证书校验开启。历史上这里是
+// 无条件 InsecureSkipVerify: true，任何 https CDP 端点都能被中间人伪造。
+func chromeProbeOptions(cfg *config.Config) chrome.ProbeOptions {
+	return chrome.ProbeOptions{InsecureSkipVerify: cfg.ChromeInsecureTLS}
+}
+
 // runWebMode 启动 web 界面模式，并把 Ctrl+C / SIGTERM 接到优雅停机。
 func runWebMode(addr string, cfg *config.Config) error {
 	// signal.NotifyContext 接管 SIGINT/SIGTERM：ctx 被取消后 web.RunWebServer 会调用
@@ -299,7 +344,8 @@ func runWebMode(addr string, cfg *config.Config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	wsURL, launchedLocalChrome, err := chrome.EnsureChromeConnectionDetailed(cfg.ChromeRemoteURL, chrome.StartupCDPTimeout)
+	wsURL, launchedLocalChrome, err := chrome.EnsureChromeConnectionDetailedWith(
+		cfg.ChromeRemoteURL, chrome.StartupCDPTimeout, chromeProbeOptions(cfg))
 	if err != nil {
 		log.Printf("Failed to prepare Chrome CDP for web mode: %v", err)
 		logChromeHelp()
@@ -318,20 +364,30 @@ func runWebMode(addr string, cfg *config.Config) error {
 		}()
 	}
 
+	// 配置里写了 apiToken 却同时留空，等价于不启用鉴权：这里不做额外判断，
+	// 由 web 侧按「空 = 关闭」处理，保持配置语义单一。
+	if cfg.APIToken == "" {
+		log.Println("WARN: apiToken 为空，Web API 无鉴权；同网段设备可直接写任务队列。" +
+			"如需暴露到本机之外，请在 config.yaml 设置 apiToken（详见 README「安全与暴露方式」）")
+	}
+
 	runErr := web.RunWebServer(&web.Options{
-		Ctx:             ctx,
-		Addr:            addr,
-		CacheDir:        cfg.CacheDir,
-		DownDir:         cfg.DownDir,
-		MaxWorkers:      cfg.MaxDownloadWorkers,
-		ChromeRemoteURL: cfg.ChromeRemoteURL,
-		WSURL:           wsURL,
-		HTTPProxy:       cfg.HttpProxy,
-		VideoResolution: cfg.VideoResolution,
-		ClearCache:      cfg.ClearCache,
-		SingleCode:      cfg.SingleCode,
-		ListCode:        cfg.ListCode,
-		EmbedFS:         embeddedWebFS,
+		Ctx:               ctx,
+		Addr:              addr,
+		CacheDir:          cfg.CacheDir,
+		DownDir:           cfg.DownDir,
+		MaxWorkers:        cfg.MaxDownloadWorkers,
+		ChromeRemoteURL:   cfg.ChromeRemoteURL,
+		WSURL:             wsURL,
+		HTTPProxy:         cfg.HttpProxy,
+		VideoResolution:   cfg.VideoResolution,
+		ClearCache:        cfg.ClearCache,
+		SingleCode:        cfg.SingleCode,
+		ListCode:          cfg.ListCode,
+		EmbedFS:           embeddedWebFS,
+		APIToken:          cfg.APIToken,
+		APIAllowOrigin:    cfg.APIAllowOrigin,
+		ChromeInsecureTLS: cfg.ChromeInsecureTLS,
 	})
 	if runErr != nil {
 		return fmt.Errorf("web server: %w", runErr)
@@ -355,7 +411,7 @@ func runCLIMode(cfg *config.Config) error {
 	log.Printf("Configuration loaded: RemoteURL=%s, DownDir=%s, CacheDir=%s, Workers=%d",
 		cfg.ChromeRemoteURL, cfg.DownDir, cfg.CacheDir, cfg.MaxDownloadWorkers)
 
-	wsURL, err := chrome.EnsureChromeConnection(cfg.ChromeRemoteURL, chrome.StartupCDPTimeout)
+	wsURL, err := chrome.EnsureChromeConnectionWith(cfg.ChromeRemoteURL, chrome.StartupCDPTimeout, chromeProbeOptions(cfg))
 	if err != nil {
 		log.Printf("Failed to prepare Chrome CDP: %v", err)
 		logChromeHelp()
@@ -391,12 +447,18 @@ func runCLIMode(cfg *config.Config) error {
 
 		// 1. 单个视频
 		for _, id := range cfg.SingleCode {
+			if !validID("video", id) {
+				continue
+			}
 			adder.add(VideoTask{VideoID: id, ListID: ""})
 		}
 
 		// 2. 区分缓存和网络的播放列表
 		var cachedLists, networkLists []string
 		for _, listID := range cfg.ListCode {
+			if !validID("playlist", listID) {
+				continue
+			}
 			cacheFile := filepath.Join(cfg.CacheDir, fmt.Sprintf("list_%s.json", listID))
 			if _, err := os.Stat(cacheFile); err == nil {
 				cachedLists = append(cachedLists, listID)
@@ -415,10 +477,21 @@ func runCLIMode(cfg *config.Config) error {
 				log.Printf("Failed to get playlist %s: %v", listID, err)
 				return
 			}
-			log.Printf("Playlist %s acquired: %d videos found", listID, len(list))
-
-			registerListMembers(listID, list)
+			// 列表成员来自网页，是不可信输入：非法 ID 直接丢弃，
+			// 不进入后续的信息解析与缓存写入。
+			valid := list[:0]
 			for _, vid := range list {
+				if validID("video", vid) {
+					valid = append(valid, vid)
+				}
+			}
+			if len(valid) != len(list) {
+				log.Printf("WARN: playlist %s 中有 %d 个视频 ID 形状非法，已跳过", listID, len(list)-len(valid))
+			}
+			log.Printf("Playlist %s acquired: %d videos found", listID, len(valid))
+
+			registerListMembers(listID, valid)
+			for _, vid := range valid {
 				adder.add(VideoTask{VideoID: vid, ListID: listID})
 			}
 		}

@@ -45,6 +45,21 @@ type Launcher struct {
 	cleaned    bool
 }
 
+// ProbeOptions 控制 CDP 端点探测的行为。零值即安全默认。
+//
+// 为什么要有这个结构体：旧实现在 fetchWebSocketDebuggerURL 里**无条件**写死
+// `InsecureSkipVerify: true`，于是任何 https CDP 端点的证书校验都被关掉，
+// 中间人可以随意伪造「Chrome 调试端点」并拿到全部 DevTools 控制权。
+// 跳过校验对自签名端点确实有用，所以保留能力，但改成显式、默认关闭的开关。
+type ProbeOptions struct {
+	// InsecureSkipVerify 允许自签名 / 无法链到系统根证书的 https CDP 端点。
+	// 默认 false（校验证书）。仅在确实使用自签名 CDP 时打开。
+	InsecureSkipVerify bool
+}
+
+// secureProbe 是默认探测选项（校验证书）。
+var secureProbe = ProbeOptions{}
+
 // 本进程拉起的本地 Chrome 注册表。
 //
 // 为什么需要它：StartLocalChrome 用 Setsid 让 Chrome 独立成进程组并常驻，本进程退出
@@ -75,12 +90,18 @@ func closeQuietly(c io.Closer, what string) {
 //
 // 总预算为 StartupCDPTimeout：在该预算内按 cdpPollInterval 轮询，单次请求不超过
 // cdpProbeTimeout。调用方因此能确定「这一次探测最多花多久」。
+// 证书校验按默认开启；需要自签名端点时改用 GetWebSocketDebuggerURLWith。
 func GetWebSocketDebuggerURL(uri string) (string, error) {
-	return GetWebSocketDebuggerURLWithTimeout(uri, StartupCDPTimeout)
+	return GetWebSocketDebuggerURLWith(uri, StartupCDPTimeout, secureProbe)
 }
 
-// GetWebSocketDebuggerURLWithTimeout 在限定时间内快速检查 CDP 端点
+// GetWebSocketDebuggerURLWithTimeout 在限定时间内快速检查 CDP 端点（证书校验开启）。
 func GetWebSocketDebuggerURLWithTimeout(uri string, timeout time.Duration) (string, error) {
+	return GetWebSocketDebuggerURLWith(uri, timeout, secureProbe)
+}
+
+// GetWebSocketDebuggerURLWith 在限定时间内检查 CDP 端点，并按 opts 决定是否跳过证书校验。
+func GetWebSocketDebuggerURLWith(uri string, timeout time.Duration, opts ProbeOptions) (string, error) {
 	if uri == "" {
 		return "", errors.New("CDP endpoint is empty")
 	}
@@ -104,7 +125,7 @@ func GetWebSocketDebuggerURLWithTimeout(uri string, timeout time.Duration) (stri
 		}
 
 		requestTimeout := minDuration(cdpProbeTimeout, remaining)
-		wsURL, err := fetchWebSocketDebuggerURL(uri, requestTimeout)
+		wsURL, err := fetchWebSocketDebuggerURL(uri, requestTimeout, opts)
 		if err == nil {
 			return wsURL, nil
 		}
@@ -123,7 +144,7 @@ func GetWebSocketDebuggerURLWithTimeout(uri string, timeout time.Duration) (stri
 	return "", fmt.Errorf("failed to connect within %s: %w", timeout, lastErr)
 }
 
-func fetchWebSocketDebuggerURL(uri string, requestTimeout time.Duration) (string, error) {
+func fetchWebSocketDebuggerURL(uri string, requestTimeout time.Duration, opts ProbeOptions) (string, error) {
 	// 解析 URL 获取主机
 	parsedURL, parseErr := url.Parse(uri)
 	baseHost := ""
@@ -132,7 +153,9 @@ func fetchWebSocketDebuggerURL(uri string, requestTimeout time.Duration) (string
 	}
 
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		// 只有调用方显式要求时才跳过校验：零值 ProbeOptions 保持证书校验开启。
+		// 旧实现在这里无条件写 true，任何 https CDP 端点都可被中间人伪造。
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: opts.InsecureSkipVerify},
 	}
 	client := &http.Client{
 		Transport: tr,
@@ -197,13 +220,18 @@ func fetchWebSocketDebuggerURL(uri string, requestTimeout time.Duration) (string
 	return wsInfo.WebSocketDebuggerURL, nil
 }
 
-// AutoDetectChrome 扫描常见 Chrome 调试端口
+// AutoDetectChrome 扫描常见 Chrome 调试端口（证书校验开启）。
 func AutoDetectChrome() string {
-	return AutoDetectChromeWithTimeout(0)
+	return AutoDetectChromeWith(0, secureProbe)
 }
 
-// AutoDetectChromeWithTimeout 在限定时间内扫描常见 Chrome 调试端口
+// AutoDetectChromeWithTimeout 在限定时间内扫描常见 Chrome 调试端口（证书校验开启）。
 func AutoDetectChromeWithTimeout(timeout time.Duration) string {
+	return AutoDetectChromeWith(timeout, secureProbe)
+}
+
+// AutoDetectChromeWith 扫描常见 Chrome 调试端口，并按 opts 决定是否跳过证书校验。
+func AutoDetectChromeWith(timeout time.Duration, opts ProbeOptions) string {
 	ports := []int{9222, 9223, 9224, 9225, 9226, 9227, 9228, 9229, 9230}
 
 	log.Println("Scanning for available Chrome instances on common debugging ports...")
@@ -233,9 +261,9 @@ func AutoDetectChromeWithTimeout(timeout time.Duration) string {
 		var wsURL string
 		if deadline.IsZero() {
 			// 无总预算（AutoDetectChrome 的显式语义）：每个端口最多花 StartupCDPTimeout。
-			wsURL, err = GetWebSocketDebuggerURL(url)
+			wsURL, err = GetWebSocketDebuggerURLWith(url, StartupCDPTimeout, opts)
 		} else {
-			wsURL, err = GetWebSocketDebuggerURLWithTimeout(url, minDuration(cdpProbeTimeout, time.Until(deadline)))
+			wsURL, err = GetWebSocketDebuggerURLWith(url, minDuration(cdpProbeTimeout, time.Until(deadline)), opts)
 		}
 		if err == nil && wsURL != "" {
 			log.Printf("Found Chrome instance on port %d: %s", port, wsURL)
@@ -247,21 +275,34 @@ func AutoDetectChromeWithTimeout(timeout time.Duration) string {
 	return ""
 }
 
-// EnsureChromeConnection 确保启动阶段存在可用的 Chrome CDP 连接
+// EnsureChromeConnection 确保启动阶段存在可用的 Chrome CDP 连接（证书校验开启）。
 func EnsureChromeConnection(remoteURL string, timeout time.Duration) (string, error) {
-	wsURL, _, err := EnsureChromeConnectionDetailed(remoteURL, timeout)
+	wsURL, _, err := EnsureChromeConnectionDetailedWith(remoteURL, timeout, secureProbe)
 	return wsURL, err
 }
 
 // EnsureChromeConnectionDetailed 返回 CDP 地址以及是否在本次调用中拉起了本地 Chrome
+// （证书校验开启）。
 func EnsureChromeConnectionDetailed(remoteURL string, timeout time.Duration) (string, bool, error) {
+	return EnsureChromeConnectionDetailedWith(remoteURL, timeout, secureProbe)
+}
+
+// EnsureChromeConnectionWith 是 EnsureChromeConnection 的带选项版本。
+func EnsureChromeConnectionWith(remoteURL string, timeout time.Duration, opts ProbeOptions) (string, error) {
+	wsURL, _, err := EnsureChromeConnectionDetailedWith(remoteURL, timeout, opts)
+	return wsURL, err
+}
+
+// EnsureChromeConnectionDetailedWith 是 EnsureChromeConnectionDetailed 的带选项版本：
+// 探测配置端点与扫描本机端口两条路径都按 opts 决定是否跳过证书校验。
+func EnsureChromeConnectionDetailedWith(remoteURL string, timeout time.Duration, opts ProbeOptions) (string, bool, error) {
 	if timeout <= 0 {
 		timeout = StartupCDPTimeout
 	}
 
 	if remoteURL != "" {
 		log.Printf("Checking configured Chrome CDP endpoint with %s timeout: %s", timeout, remoteURL)
-		wsURL, err := GetWebSocketDebuggerURLWithTimeout(remoteURL, timeout)
+		wsURL, err := GetWebSocketDebuggerURLWith(remoteURL, timeout, opts)
 		if err == nil && wsURL != "" {
 			log.Printf("Successfully connected to Chrome CDP: %s", wsURL)
 			return wsURL, false, nil
@@ -271,7 +312,7 @@ func EnsureChromeConnectionDetailed(remoteURL string, timeout time.Duration) (st
 		log.Printf("Chrome CDP endpoint is empty, trying local Chrome immediately")
 	}
 
-	if wsURL := AutoDetectChromeWithTimeout(timeout); wsURL != "" {
+	if wsURL := AutoDetectChromeWith(timeout, opts); wsURL != "" {
 		return wsURL, false, nil
 	}
 

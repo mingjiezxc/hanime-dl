@@ -1,0 +1,63 @@
+name: CI
+
+# 为什么要这条工作流：本仓库的质量基线是「gofmt 干净 + vet 无告警 + 全部测试 -race
+# 通过 + golangci-lint 0 issues」，但它只存在于本地手动执行的 `make all`。
+# 没有 CI，任何一次忘记跑检查的提交都能把基线悄悄磨掉。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: 质量门（fmt / vet / build / test -race / lint）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go（版本取自 go.mod）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # 刻意关掉 setup-go 的缓存：Makefile 把 GOCACHE 指到仓库内 .dbg/gocache
+          # （为了绕开某些机器上 HOME 下构建缓存只读的问题），缓存位置与 setup-go
+          # 默认监控的 ~/.cache/go-build 不一致，开着也不会命中。
+          cache: false
+
+      - name: gofmt / vet / build / test -race
+        run: make fmt-check vet build test
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          # 与本仓库验证过的版本对齐（.golangci.yml 是 v2 schema，换大版本可能改语义）。
+          version: v2.14.0
+          args: --timeout=5m
+
+  cross-compile:
+    name: 交叉编译冒烟检查（发布产物目标）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 编译六个发布目标
+        # release.sh 会构建这六个目标；这里先编译一遍，避免「CI 绿但发不出去」。
+        run: |
+          export GOCACHE="$PWD/.dbg/gocache"
+          mkdir -p "$GOCACHE"
+          for target in linux/amd64 linux/arm64 windows/amd64 windows/arm64 darwin/amd64 darwin/arm64; do
+            GOOS="${target%/*}" GOARCH="${target#*/}" \
+              go build -o /dev/null . && echo "OK ${target}"
+          done

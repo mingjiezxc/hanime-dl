@@ -2,16 +2,20 @@ package scraper
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"hanime-dl/internal/idutil"
 )
 
 // 本文件只测试纯函数：不启动 Chrome、不访问网络。
-// 所有涉及 chromedp 的流程（GetPlaylist / ResolveVideoInfo / RefreshVideoDataURL /
-// fetchDownloadLinks / fetchHighResCover）都无法离线运行，因此不被覆盖；
+// 所有涉及 chromedp 的流程（fetchDownloadLinks / fetchHighResCover 等）无法离线运行，
+// 因此不被覆盖；GetPlaylist / ResolveVideoInfo / RefreshVideoDataURL 只有**入口校验**
+// 那一段可离线覆盖（见文件末尾），校验之后的浏览器流程仍未覆盖。
 // 它们依赖的可抽取逻辑（JS 结果转换、分辨率选择、目录名推导、文件名截断、
 // 搜索 URL 构造）全部抽成纯函数后在此验证。
 
@@ -518,4 +522,71 @@ func TestWriteJSONFileBehaviour(t *testing.T) {
 
 	// 不可序列化的值：同样只打 WARN。
 	writeJSONFile(filepath.Join(dir, "bad.json"), make(chan int))
+}
+
+// --- 入口 ID 校验（Tranche A）---
+//
+// 这三个用例覆盖的是 GetPlaylist / ResolveVideoInfo / RefreshVideoDataURL 的**入口**：
+// 校验在触碰 chromedp 之前完成，所以它们是本文件里唯一能离线跑通的
+// 「原本必须起浏览器」的方法。非法 ID 直接返回错误，既不发 CDP 请求、
+// 也不写任何缓存文件——后者正是这条校验存在的理由。
+
+func TestGetPlaylistRejectsInvalidListID(t *testing.T) {
+	dir := t.TempDir()
+	s := NewScraper(dir, dir, "1080p")
+
+	for _, bad := range []string{"", "..", "a/../../b", "../../etc/passwd", "has space"} {
+		got, err := s.GetPlaylist("ws://unused:0/devtools/browser/nope", bad)
+		if err == nil {
+			t.Errorf("GetPlaylist(%q) 应当失败，实际返回 %v", bad, got)
+			continue
+		}
+		if !errors.Is(err, idutil.ErrInvalidID) {
+			t.Errorf("GetPlaylist(%q) err = %v, want errors.Is ErrInvalidID", bad, err)
+		}
+	}
+	assertDirEmpty(t, dir)
+}
+
+func TestResolveVideoInfoRejectsInvalidID(t *testing.T) {
+	dir := t.TempDir()
+	s := NewScraper(dir, dir, "1080p")
+
+	// videoID 非法
+	for _, bad := range []string{"", "..", "a/../../b"} {
+		if _, err := s.ResolveVideoInfo("ws://unused:0/devtools/browser/nope", bad, ""); !errors.Is(err, idutil.ErrInvalidID) {
+			t.Errorf("ResolveVideoInfo(video=%q) err = %v, want ErrInvalidID", bad, err)
+		}
+	}
+	// listID 非法同样要挡住
+	if _, err := s.ResolveVideoInfo("ws://unused:0/devtools/browser/nope", "405852", "a/../../b"); !errors.Is(err, idutil.ErrInvalidID) {
+		t.Errorf("ResolveVideoInfo(list 非法) err = %v, want ErrInvalidID", err)
+	}
+	assertDirEmpty(t, dir)
+}
+
+func TestRefreshVideoDataURLRejectsInvalidID(t *testing.T) {
+	dir := t.TempDir()
+	s := NewScraper(dir, dir, "1080p")
+
+	if _, err := s.RefreshVideoDataURL("ws://unused:0/devtools/browser/nope", "a/../../b"); !errors.Is(err, idutil.ErrInvalidID) {
+		t.Errorf("RefreshVideoDataURL err = %v, want ErrInvalidID", err)
+	}
+	assertDirEmpty(t, dir)
+}
+
+// assertDirEmpty 断言目录里没有被写入任何东西：校验的**目的**就是不产生路径副作用。
+func assertDirEmpty(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("读目录: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("非法 ID 不应产生任何缓存文件，实际有: %v", names)
+	}
 }

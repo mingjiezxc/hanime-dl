@@ -11,6 +11,40 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 
 ---
 
+## 🔒 安全加固（v0.4.7 之后，尚未发布）
+
+一次以「已复现的缺陷」为准的安全与数据正确性整改。下列每一项都有对应的**回归测试**
+（即：改动前该用例必然失败），不是凭印象的重构。
+
+- 🚨 **路径穿越（已确认缺陷）** - `video_id` / `list_id` 此前未做任何校验，会被直接拼进
+  `cache/info_<id>.json` 与 `cache/list_<id>.json`。`filepath.Join` 的 Clean 会让
+  `a/../../b` 变成缓存目录**之外**的 `b.json`，于是「写缓存」与「清缓存」成为任意路径写/删。
+  现在由新包 `internal/idutil` 按白名单（`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`）校验，
+  不合法一律 `400`；Web 与 CLI 两条入口都挡，`scraper` 侧另有同一条校验作为纵深防御
+- 🔁 **失败视频永久占用（已确认缺陷）** - 任务失败后认领标记从不释放，同一视频再提交
+  恒返回 `409`，只能重启进程（而重启会丢掉全部任务状态）。现在失败即释放认领，
+  成功仍去重
+- 🌐 **跨源默认关闭** - 每个响应都曾无条件带 `Access-Control-Allow-Origin: *`，
+  配合上一条意味着用户浏览器里任意网页都能跨源向这个能写盘的服务投递任务。
+  现在默认不发 CORS 头，需要跨源时显式配置 `apiAllowOrigin`
+- 🔑 **可选 API 令牌** - 新增 `apiToken`；非空时所有 `/api/*` 需要
+  `Authorization: Bearer <token>`（常量时间比较）。默认空＝不启用，以保持本机单人用法不变
+- 📏 **请求体上限** - 提交接口加 `http.MaxBytesReader`（1 MiB），此前无上限
+- 🧨 **前端转义** - `web/index.html` 的任务卡片是 `innerHTML` 拼接且全文没有任何转义函数，
+  现在补上 `escapeHtml()` 覆盖 `title` / `error_message` / `video_id` / `list_id` / `id`
+- 🔐 **Chrome CDP 证书校验改为显式开关** - 旧实现无条件 `InsecureSkipVerify: true`，
+  任何 https 调试端点都可被中间人伪造并接管 DevTools。现在默认校验，
+  自签名端点需显式设置 `chromeInsecureTLS: true`
+- 🧪 **测试覆盖** - `chrome/` 与 `config/` 从「无测试文件」变为有测试；新增配置漂移守护用例
+  （`config.example.yaml` 与 `DefaultConfigYAML` 逐字段比对，只改一边即红）
+- 🏷️ **版本注入** - 新增 `-version` 与 `-ldflags -X main.version=`，
+  产物终于能回答「用户手上跑的是哪一个二进制」
+- ⚙️ **发布脚本加固** - `release.sh` 补上执行位、依赖前置检查（`go/git/gh/zip/tar`）、
+  发布前 `make all` 质量门、六目标并行构建、分支推送检查
+- 🤖 **CI** - 新增 `.github/workflows/ci.yml`（质量门 + 交叉编译冒烟），
+  绿色基线不再只靠本地手动维持
+- 📄 **LICENSE** - README 一直声称 MIT 但仓库里没有 `LICENSE` 文件，现已补上
+
 ## 📦 最新版本：v0.4.7 (2026-10-19)
 
 ## 🛠️ v0.4.7 审计整改 (2026-10-19)
@@ -75,12 +109,18 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 
 ```
 hanime-dl/
-├── main.go                        # 主程序入口
+├── main.go                        # 主程序入口（含 -version 版本注入）
 ├── main_test.go                   # 主流程 / 进度聚合测试（离线）
 ├── config/
-│   └── config.go                  # 配置管理模块
+│   ├── config.go                  # 配置管理模块
+│   └── config_test.go             # 配置默认值 / 示例文件漂移守护测试（离线）
 ├── chrome/
-│   └── chrome.go                  # Chrome 浏览器管理模块
+│   ├── chrome.go                  # Chrome 浏览器管理模块
+│   └── chrome_test.go             # CDP 探测测试（httptest，不拉起 Chrome）
+├── internal/
+│   └── idutil/
+│       ├── idutil.go              # 视频/列表 ID 白名单校验（阻断路径穿越）
+│       └── idutil_test.go         # 含穿越复现与反向证据
 ├── scraper/
 │   ├── scraper.go                 # 网页抓取模块
 │   └── scraper_test.go            # 抓取模块纯函数测试（离线）
@@ -91,10 +131,14 @@ hanime-dl/
 │   ├── index.html                 # 内置 Web 界面（打包进二进制）
 │   ├── web_server.go              # Web 服务器模块
 │   └── web_server_test.go         # Web handler / 下载管线测试（离线）
+├── .github/workflows/
+│   └── ci.yml                     # 质量门 + 交叉编译冒烟检查
 ├── config.example.yaml            # 配置示例（提交进仓库）
 ├── config.yaml                    # 本机实际配置（首次运行自动生成，已被 .gitignore 忽略）
 ├── Makefile                       # 构建 / 检查 / 测试入口
+├── release.sh                     # 发布脚本（质量门 → 六目标并行构建 → tag + GitHub Release）
 ├── .golangci.yml                  # golangci-lint 配置（v2 schema）
+├── LICENSE                        # MIT
 ├── go.mod                         # Go 模块定义
 ├── go.sum                         # 依赖校验和
 └── README.md                      # 项目说明
@@ -108,7 +152,8 @@ hanime-dl/
 | 模块 | 功能 | 主要函数 |
 |------|------|----------|
 | `config` | 配置管理 | `LoadOrCreate()`, `MustLoadOrCreate()` |
-| `chrome` | Chrome 浏览器管理 | `GetWebSocketDebuggerURL()`, `AutoDetectChrome()`, `StartLocalChrome()`, `CreateTab()` |
+| `internal/idutil` | 视频/列表 ID 白名单校验（路径穿越防线） | `Validate()`, `IsSafe()` |
+| `chrome` | Chrome 浏览器管理 | `GetWebSocketDebuggerURL()`, `AutoDetectChrome()`, `StartLocalChrome()`, `CreateTab()`, `EnsureChromeConnectionWith()`（`ProbeOptions` 控制证书校验） |
 | `scraper` | 网页抓取 | `GetPlaylist()`, `ResolveVideoInfo()`, `RefreshVideoDataURL()` |
 | `downloader` | 文件下载 | `DownloadFile()`, `DownloadWithRetry()` |
 | `web` | Web 服务器 | `RunWebServer()`, `NewWebServer()` |
@@ -212,6 +257,17 @@ ClearCache: true
 
 # 视频分辨率（如：1080p, 720p；未配置或未命中时回落最高分辨率）
 VideoResolution: 1080p
+
+# 允许 CDP 端点使用自签名证书（跳过证书校验）。默认 false。
+# 仅在确实使用自签名远程 Chrome 时打开；打开后中间人可伪造调试端点。
+chromeInsecureTLS: false
+
+# Web API 访问令牌。留空 = 不启用鉴权（仅适合本机单人使用）。
+# 非空时所有 /api/* 请求必须带 Authorization: Bearer <token> 头。
+apiToken: ""
+
+# 允许跨源调用 API 的来源（如 http://localhost:3000）。留空 = 同源策略，不发 CORS 头。
+apiAllowOrigin: ""
 ```
 
 ### 配置项说明
@@ -227,6 +283,9 @@ VideoResolution: 1080p
 | `SingleCode` | []string | `[]` | 单个视频 ID 列表 |
 | `ClearCache` | bool | `true` | 单个视频下载成功后是否删除其 `cache/info_<id>.json`（列表缓存另按列表进度清理） |
 | `VideoResolution` | string | `1080p` | 目标分辨率；未配置或未命中时回落最高分辨率 |
+| `chromeInsecureTLS` | bool | `false` | 是否允许 CDP 端点使用自签名证书（跳过校验）。**默认关闭**：打开后中间人可伪造调试端点并接管 DevTools，仅在确实使用自签名远程 Chrome 时开启 |
+| `apiToken` | string | `""` | Web API 访问令牌。留空＝不启用鉴权；非空时所有 `/api/*` 必须带 `Authorization: Bearer <token>` |
+| `apiAllowOrigin` | string | `""` | 允许跨源调用 API 的来源（如 `http://localhost:3000`）。留空＝同源策略，不发送 CORS 头 |
 
 > **关于默认值与字段名大小写**
 >
@@ -258,6 +317,10 @@ VideoResolution: 1080p
 | `-config` | `config.yaml` | 配置文件路径 |
 | `-web` | `false` | 启动 Web 服务器模式 |
 | `-web-addr` | `:8080` | Web 服务器地址 |
+| `-version` | – | 打印版本与提交号后退出（不读配置、不创建 `config.yaml`） |
+
+版本由构建时注入：`go build -ldflags "-X main.version=v0.4.8 -X main.commit=$(git rev-parse --short HEAD)"`；
+未注入时显示 `dev`，也就是「本地裸 build，非发布产物」。`release.sh` 会自动注入。
 
 ### Web 界面使用 （推荐）
 
@@ -313,6 +376,86 @@ docker compose up -d
 chromeRemoteURL: http://your-chrome-host:9222/json/version
 ```
 
+
+## 🔐 安全与暴露方式
+
+先说清威胁模型，再决定怎么暴露——这个服务**不是只读面板**：
+
+- 提交任务会**在磁盘上写文件**（`CacheDir` / `DownDir`），并且能占满磁盘；
+- 抓取过程会**驱动一个 Chrome 实例**（拿到 DevTools 就等于拿到那个浏览器的全部能力）；
+- 默认监听 `:8080`，Go 的 `:8080` 绑定的是**所有网卡**，不是 `127.0.0.1`。
+
+也就是说：同网段里任何一台设备默认都能直接往你的下载目录写东西。
+
+### 三种暴露档位
+
+**1）只用本机（默认，无需改动）**
+
+面板只从本机访问时，当前默认配置即可。想更稳一点，把监听收到回环地址：
+
+```bash
+hanime-dl -web -web-addr 127.0.0.1:8080
+```
+
+**2）同网段其它设备要用**
+
+设置一个非空 `apiToken`（长随机串，例如 `openssl rand -hex 32` 生成）：
+
+```yaml
+apiToken: "把这里换成你自己生成的长随机串"
+```
+
+之后所有 `/api/*` 都必须带 `Authorization: Bearer <token>`。Web 面板首次遇到 `401`
+会提示输入一次，之后存在浏览器 `localStorage` 里——所以**不要在公共/共享浏览器上保存**，
+也不要把它写回 `config.yaml` 以外的任何地方。`config.yaml` 已被 `.gitignore` 忽略，
+不要提交它。
+
+**3）暴露到公网（反向代理 + 认证，两者都要）**
+
+不要为了省事直接 `docker run -p 8080:8080` 把它摊到公网上——那等于把
+「带令牌的写盘接口」变成全网可扫的端口，令牌一旦泄露就是任意文件写入。
+正确做法是把它放在反向代理之后，并在**代理层**再加一道认证：
+
+```yaml
+# Traefik 标签示例（域名与证书申请方式按你的环境替换）
+labels:
+  - "traefik.enable=true"
+  - "traefik.http.routers.hanime.rule=Host(`hanime.example.com`)"
+  - "traefik.http.routers.hanime.entrypoints=websecure"     # 必须 HTTPS
+  - "traefik.http.routers.hanime.tls.certresolver=le"
+  - "traefik.http.routers.hanime.middlewares=hanime-auth"
+  - "traefik.http.middlewares.hanime-auth.basicauth.users=you:$$apr1$$...."  # 双层认证
+  - "traefik.http.services.hanime.loadbalancer.server.port=8080"
+```
+
+要点：
+
+- **必须 HTTPS**。`apiToken` 是 Bearer 令牌，走明文 HTTP 等于在网络上裸奔一次。
+- **双层认证**：代理层 BasicAuth 挡住扫描与爆破，应用层 `apiToken` 挡住同源误用。
+- 容器网络里让代理访问应用时，把应用端口只发布到容器网络，**不要**再 `-p` 到宿主机。
+- 反代到 `127.0.0.1:8080` 时记得用 `-web-addr 127.0.0.1:8080` 收紧绑定。
+
+### 与 CORS
+
+默认**不发送**任何 `Access-Control-Allow-Origin` 头（v0.4.7 之前是无条件 `*`）。
+确实需要跨源调用 API 时，显式写那一个来源：
+
+```yaml
+apiAllowOrigin: "http://localhost:3000"   # 只允许这一个源，不要用 *
+```
+
+### `chromeInsecureTLS`
+
+默认 `false`，即 CDP 端点的 TLS 证书**要校验**。设为 `true` 会跳过校验，
+适用于自签名证书的远程 Chrome，但代价是中间人可以伪造「Chrome 调试端点」
+并接管那个浏览器会话。除非你确实如此部署，否则保持 `false`。
+
+### 当前仍未做的（暴露前请自行评估）
+
+- 没有速率限制与账号体系：`apiToken` 是单一共享令牌，无法区分调用者、无法单独吊销。
+- 没有 CSRF 之外的请求签名；GET `/api/tasks` 等只读接口同样受 `apiToken` 保护。
+- 任务状态在内存中，进程重启即丢失（这也是「失败视频永久占用」那个缺陷曾经难以绕过的原因）。
+- 应用自身不提供 HTTPS，请始终由反向代理终结 TLS。
 
 ## 工作流程
 
@@ -496,6 +639,19 @@ ListCode: []
 SingleCode: []
 ClearCache: true
 VideoResolution: 1080p
+
+# Allow the CDP endpoint to use a self-signed certificate (skip TLS verification).
+# Default false. Only enable it for a genuinely self-signed remote Chrome — with it on,
+# a man-in-the-middle can impersonate the debugging endpoint.
+chromeInsecureTLS: false
+
+# Web API bearer token. Empty = no authentication (fine for single-user local use only).
+# When set, every /api/* request must carry an `Authorization: Bearer <token>` header.
+apiToken: ""
+
+# Origin allowed to call the API cross-origin (e.g. http://localhost:3000).
+# Empty = same-origin policy, no CORS headers emitted.
+apiAllowOrigin: ""
 ```
 YAML keys are **case-sensitive** and a misspelled key is silently ignored (the field just
 stays empty), so copy the spellings exactly — especially `chromeRemoteURL`.
@@ -531,6 +687,36 @@ Access `http://localhost:8080` for:
 - ⚙️ Configure download parameters
 - 🎬 Manage video download tasks
 - 📊 Real-time download status
+
+#### Security & Exposure
+
+This service is **not** a read-only dashboard: submitting a task writes files to disk
+(`CacheDir` / `DownDir`) and can fill the volume, scraping drives a Chrome instance
+(DevTools access means full control of that browser), and `-web-addr :8080` binds
+**all interfaces**, not just loopback. By default, any device on your LAN can enqueue writes.
+
+Three exposure tiers:
+
+1. **Local only (default)** — nothing to change. Tighten with `-web-addr 127.0.0.1:8080`.
+2. **Same LAN** — set a non-empty `apiToken` (e.g. `openssl rand -hex 32`). Every `/api/*`
+   request then needs `Authorization: Bearer <token>`; the dashboard prompts for it on the
+   first `401` and keeps it in `localStorage`. Never commit `config.yaml` (already gitignored).
+3. **Public internet** — put it behind a reverse proxy that terminates TLS **and** adds its own
+   auth layer (e.g. Traefik BasicAuth), keeping the app port unpublished from the host.
+   Plain HTTP is not acceptable here: a bearer token over cleartext leaks on every request.
+
+Related defaults changed in this round:
+
+- No `Access-Control-Allow-Origin` header is emitted unless you set `apiAllowOrigin`
+  (before v0.4.7 every response said `*`, so any webpage in your browser could enqueue tasks).
+- `chromeInsecureTLS` defaults to `false`, i.e. CDP endpoint certificates **are** verified.
+  Enabling it lets a man-in-the-middle impersonate your Chrome debugging endpoint.
+- IDs are validated against an allowlist (`internal/idutil`); hostile shapes now fail with `400`
+  instead of escaping the cache directory via `filepath.Join`.
+
+Still not implemented — assess before exposing: no rate limiting, no per-user credentials
+(one shared token cannot be revoked individually), no HTTPS in the app itself, and task state
+lives in memory (a restart loses it).
 
 #### Releases
 - **v0.4.7** (2026-10-19): Code-audit remediation — download integrity (byte-count validation, 206

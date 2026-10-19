@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"hanime-dl/chrome"
 	"hanime-dl/config"
 	"hanime-dl/downloader"
+	"hanime-dl/internal/idutil"
 	"hanime-dl/scraper"
 )
 
@@ -37,13 +39,27 @@ const (
 	// seenWarnStep 每认领这么多个唯一视频就打一条提示日志，让长期驻留部署能观察到
 	// seen 集合的增长。
 	seenWarnStep = 10000
+	// maxSubmitBodyBytes 限制 /api/tasks、/api/submit 请求体大小。
+	//
+	// 请求体是 {"video_id":"...","list_id":"..."} 这样的小对象，合法输入远小于 1 MiB。
+	// 不设上限时 json.Decoder 会把整个 body 读进内存，而这个服务默认无鉴权、
+	// 默认绑定 :8080（整个局域网可达），一个大 body 就是一次内存压力攻击。
+	maxSubmitBodyBytes = 1 << 20
 )
 
 // 流水线错误。handler 通过 statusForError 把它们映射为 HTTP 状态码。
 var (
 	// ErrMissingTarget video_id 与 list_id 同时为空。
 	ErrMissingTarget = errors.New("video_id or list_id is required")
-	// ErrDuplicateVideo 该视频已被认领（在队列中或已处理过）。
+	// ErrInvalidTarget video_id / list_id 形状不合法。
+	//
+	// 这不是「输入不好看」的问题：这两个 ID 会被拼进磁盘路径
+	// （cache/info_<id>.json、cache/list_<id>.json），未校验的 ID 经 filepath.Join
+	// 的 Clean 之后可以逃出缓存目录，把缓存写入与清理变成任意路径写/删。
+	// 详见 internal/idutil 的包注释。这里刻意复用同一个哨兵，
+	// 使 errors.Is(err, idutil.ErrInvalidID) 与 errors.Is(err, ErrInvalidTarget) 等价。
+	ErrInvalidTarget = idutil.ErrInvalidID
+	// ErrDuplicateVideo 该视频已被认领（在队列中或已成功处理过）。
 	ErrDuplicateVideo = errors.New("video already queued")
 	// ErrQueueFull 在入队预算内队列始终没有空位（显式背压）。
 	ErrQueueFull = errors.New("download queue is full, please retry later")
@@ -51,6 +67,8 @@ var (
 	ErrServerStopped = errors.New("web server is stopping")
 	// ErrEnqueueCanceled 等待入队期间请求被取消（通常是客户端断开）。
 	ErrEnqueueCanceled = errors.New("request canceled while waiting for queue space")
+	// ErrUnauthorized 请求缺少或携带了错误的 API token。
+	ErrUnauthorized = errors.New("missing or invalid API token")
 )
 
 // videoResolver 抽象视频信息与播放列表的解析能力。
@@ -115,6 +133,23 @@ type Options struct {
 	// 它被取消时，服务器会走优雅停机：停止接受请求、唤醒阻塞的入队、结束 worker。
 	// 为 nil 时表示不响应外部停机信号。
 	Ctx context.Context
+	// APIToken 非空时，所有 /api/* 请求必须携带 `Authorization: Bearer <token>`
+	// （常数时间比较）。为空表示不启用鉴权——本机单人使用的默认形态。
+	//
+	// 为什么要有它：这个服务能按请求写盘与删文件，默认又绑定 :8080（整个局域网可达），
+	// 裸暴露等于把文件系统的一个角落交给同网段的任何设备。
+	APIToken string
+	// APIAllowOrigin 需要跨源访问 API 时的显式来源（例如 "http://localhost:3000"）。
+	// 为空表示**不设** Access-Control-Allow-Origin——即默认同源策略。
+	//
+	// 旧实现对每个响应无条件写 `*`，于是用户浏览器里访问的任意网页都能对本服务
+	// 发起跨源 POST（提交下载任务、读取任务列表）。默认关闭跨源是更安全的缺省。
+	APIAllowOrigin string
+	// ChromeInsecureTLS 允许 CDP 端点使用自签名证书（跳过证书校验）。默认 false。
+	//
+	// 旧实现无条件 InsecureSkipVerify: true，对所有 https CDP 探测关闭证书校验，
+	// 中间人可任意伪造「Chrome 调试端点」。现在这变成一个显式的、默认关闭的开关。
+	ChromeInsecureTLS bool
 }
 
 // WebServer manages the web interface and the download pipeline
@@ -167,6 +202,11 @@ type WebServer struct {
 
 	embedFS fs.FS
 
+	// apiToken / apiAllowOrigin 来自 Options，见各自的注释。
+	// apiToken 为空表示不启用鉴权；apiAllowOrigin 为空表示不设 CORS 头。
+	apiToken       string
+	apiAllowOrigin string
+
 	// seen 记录本进程已认领（已入队或已展开）的视频 ID。
 	//
 	// 语义：认领是**进程生命周期**的，不随任务完成释放 —— 这是「重复展开同一列表
@@ -199,6 +239,19 @@ func NewWebServer(opts *Options) *WebServer {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parent)
+
+	// connectChrome 默认与历史行为一致（chrome.EnsureChromeConnection）。
+	// 只有显式打开 ChromeInsecureTLS 时才换成带跳过校验的探测——并且仍然保持
+	// 字段签名不变，测试里的 connectChrome 注入点不受影响。
+	connect := chrome.EnsureChromeConnection
+	if opts.ChromeInsecureTLS {
+		connect = func(remoteURL string, timeout time.Duration) (string, error) {
+			return chrome.EnsureChromeConnectionWith(remoteURL, timeout, chrome.ProbeOptions{
+				InsecureSkipVerify: true,
+			})
+		}
+	}
+
 	return &WebServer{
 		tasks:           make(map[string]*TaskStatus),
 		resolver:        scraper.NewScraper(opts.CacheDir, opts.DownDir, opts.VideoResolution),
@@ -208,13 +261,15 @@ func NewWebServer(opts *Options) *WebServer {
 		chromeRemoteURL: opts.ChromeRemoteURL,
 		clearCache:      opts.ClearCache,
 		wsURL:           opts.WSURL,
-		connectChrome:   chrome.EnsureChromeConnection,
+		connectChrome:   connect,
 		ctx:             ctx,
 		cancel:          cancel,
 		queue:           make(chan *TaskStatus, taskQueueSize),
 		listQueue:       make(chan *TaskStatus, listQueueSize),
 		maxWorkers:      maxWorkers,
 		embedFS:         opts.EmbedFS,
+		apiToken:        opts.APIToken,
+		apiAllowOrigin:  opts.APIAllowOrigin,
 		seen:            make(map[string]struct{}),
 	}
 }
@@ -357,11 +412,13 @@ func (ws *WebServer) refreshWSURL() (string, error) {
 // SetupRoutes 可重复调用，测试也可以直接 httptest.NewServer(ws.Handler())。
 func (ws *WebServer) SetupRoutes() error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/tasks", ws.handleTasks)
-	mux.HandleFunc("/api/tasks/", ws.handleTaskByID)
-	mux.HandleFunc("/api/submit", ws.handleSubmit)
-	mux.HandleFunc("/api/status/", ws.handleStatus)
-	mux.HandleFunc("/api/progress", ws.handleProgress)
+	// API 路由统一过 token 守卫（apiToken 为空时守卫是直通，行为与历史一致）。
+	// 静态资源不在守卫内：面板 HTML 本身不含敏感数据，加了守卫页面就无法加载。
+	mux.Handle("/api/tasks", ws.requireToken(http.HandlerFunc(ws.handleTasks)))
+	mux.Handle("/api/tasks/", ws.requireToken(http.HandlerFunc(ws.handleTaskByID)))
+	mux.Handle("/api/submit", ws.requireToken(http.HandlerFunc(ws.handleSubmit)))
+	mux.Handle("/api/status/", ws.requireToken(http.HandlerFunc(ws.handleStatus)))
+	mux.Handle("/api/progress", ws.requireToken(http.HandlerFunc(ws.handleProgress)))
 
 	// 静态资源：优先使用内嵌文件系统，未提供时回退到本地 ./web 目录（开发场景）
 	var staticFS fs.FS
@@ -385,16 +442,23 @@ func (ws *WebServer) Handler() http.Handler {
 	return ws.mux
 }
 
-func writeJSONHeaders(w http.ResponseWriter) {
+// writeJSONHeaders 写响应头。
+//
+// CORS 只在显式配置了 APIAllowOrigin 时才设置：旧实现对每个响应无条件写
+// `Access-Control-Allow-Origin: *`，等于允许用户浏览器里任意网页对本服务发起
+// 跨源读写（提交任务、读取任务列表）。默认回到同源策略。
+func (ws *WebServer) writeJSONHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if ws.apiAllowOrigin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", ws.apiAllowOrigin)
+	}
 }
 
 // writeJSON 写 JSON 响应，记录编码失败。
 //
 // 编码失败时响应头已经写出，无法再改状态码，只能记日志（审计 P2-8 的 errcheck 项）。
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	writeJSONHeaders(w)
+func (ws *WebServer) writeJSON(w http.ResponseWriter, status int, v any) {
+	ws.writeJSONHeaders(w)
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("Failed to encode JSON response: %v", err)
@@ -412,9 +476,9 @@ type apiError struct {
 	Message string `json:"message"`
 }
 
-// writeJSONError 统一错误响应为 JSON，并保留 CORS 头与正确状态码。
-func writeJSONError(w http.ResponseWriter, status int, msg string) {
-	writeJSONHeaders(w)
+// writeJSONError 统一错误响应为 JSON，并保留正确状态码。
+func (ws *WebServer) writeJSONError(w http.ResponseWriter, status int, msg string) {
+	ws.writeJSONHeaders(w)
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(apiError{Error: msg, Message: msg}); err != nil {
 		log.Printf("Failed to encode JSON error response: %v", err)
@@ -426,13 +490,46 @@ func statusForError(err error) int {
 	switch {
 	case errors.Is(err, ErrMissingTarget):
 		return http.StatusBadRequest
+	case errors.Is(err, ErrInvalidTarget):
+		return http.StatusBadRequest
 	case errors.Is(err, ErrDuplicateVideo):
 		return http.StatusConflict
 	case errors.Is(err, ErrQueueFull), errors.Is(err, ErrServerStopped), errors.Is(err, ErrEnqueueCanceled):
 		return http.StatusServiceUnavailable
+	case errors.Is(err, ErrUnauthorized):
+		return http.StatusUnauthorized
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+// requireToken 在 apiToken 非空时守卫 /api/* 路由；未启用时原样返回内层 handler。
+//
+// 比较走 crypto/subtle 的常数时间路径，避免「按前缀匹配成功即提前返回」
+// 这类可被计时侧信道利用的比较方式。静态资源不受该守卫影响。
+func (ws *WebServer) requireToken(next http.Handler) http.Handler {
+	if ws.apiToken == "" {
+		return next
+	}
+	want := []byte(ws.apiToken)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		provided, ok := bearerToken(r)
+		if !ok || subtle.ConstantTimeCompare([]byte(provided), want) != 1 {
+			ws.writeJSONError(w, statusForError(ErrUnauthorized), ErrUnauthorized.Error())
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// bearerToken 取 Authorization 头里的 Bearer token。
+func bearerToken(r *http.Request) (string, bool) {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	const prefix = "Bearer "
+	if len(auth) <= len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return "", false
+	}
+	return strings.TrimSpace(auth[len(prefix):]), true
 }
 
 // submitRequest 是 /api/tasks 与 /api/submit 的请求体。
@@ -446,9 +543,13 @@ type submitRequest struct {
 // dispatchRequest 解析请求体并按背压提交任务，返回给 handler 的 (task, err)。
 // ctx 用于限制入队等待时间。
 func (ws *WebServer) dispatchRequest(w http.ResponseWriter, r *http.Request) {
+	// 请求体上限：合法 body 是几十字节的小对象，超过 maxSubmitBodyBytes 一律拒绝。
+	// MaxBytesReader 在超限时让 Decode 返回错误，从而复用下面这条已有的 400 路径。
+	r.Body = http.MaxBytesReader(w, r.Body, maxSubmitBodyBytes)
+
 	var req submitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		ws.writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), TaskEnqueueTimeout)
@@ -456,44 +557,44 @@ func (ws *WebServer) dispatchRequest(w http.ResponseWriter, r *http.Request) {
 
 	task, err := ws.createAndDispatchTask(ctx, req.VideoID, req.ListID, req.Type, req.Mode)
 	if err != nil {
-		writeJSONError(w, statusForError(err), err.Error())
+		ws.writeJSONError(w, statusForError(err), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, task)
+	ws.writeJSON(w, http.StatusCreated, task)
 }
 
 func (ws *WebServer) handleTasks(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, ws.snapshotTasks())
+		ws.writeJSON(w, http.StatusOK, ws.snapshotTasks())
 	case http.MethodPost:
 		ws.dispatchRequest(w, r)
 	default:
 		w.Header().Set("Allow", "GET, POST")
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
+		ws.writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
 	}
 }
 
 func (ws *WebServer) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
+		ws.writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
 
 	task, ok := ws.snapshotTask(id)
 	if !ok {
-		writeJSONError(w, http.StatusNotFound, "task not found: "+id)
+		ws.writeJSONError(w, http.StatusNotFound, "task not found: "+id)
 		return
 	}
-	writeJSON(w, http.StatusOK, task)
+	ws.writeJSON(w, http.StatusOK, task)
 }
 
 func (ws *WebServer) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
+		ws.writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
 		return
 	}
 	ws.dispatchRequest(w, r)
@@ -502,8 +603,9 @@ func (ws *WebServer) handleSubmit(w http.ResponseWriter, r *http.Request) {
 // createAndDispatchTask 创建任务、加入任务表并按背压推入队列。
 //
 // 返回 (task, nil) 表示已入队；其余情况 task 为 nil，err 为 ErrMissingTarget /
-// ErrDuplicateVideo / ErrQueueFull / ErrServerStopped / ErrEnqueueCanceled，
-// 由 handler 用 statusForError 映射状态码。ctx 只约束入队等待，不参与任务执行。
+// ErrInvalidTarget / ErrDuplicateVideo / ErrQueueFull / ErrServerStopped /
+// ErrEnqueueCanceled，由 handler 用 statusForError 映射状态码。
+// ctx 只约束入队等待，不参与任务执行。
 func (ws *WebServer) createAndDispatchTask(ctx context.Context, videoID, listID, typeField, modeField string) (*TaskStatus, error) {
 	videoID = strings.TrimSpace(videoID)
 	listID = strings.TrimSpace(listID)
@@ -512,6 +614,21 @@ func (ws *WebServer) createAndDispatchTask(ctx context.Context, videoID, listID,
 	// （审计 P2-6 的死判断）。
 	if videoID == "" && listID == "" {
 		return nil, ErrMissingTarget
+	}
+
+	// 形状校验必须在**认领与建任务之前**：这两个 ID 之后会被拼进磁盘路径
+	// （cache/info_<id>.json、cache/list_<id>.json），未校验的值可以逃出缓存目录，
+	// 把「写缓存」与「清缓存」变成任意路径写/删。放在 markSeen 之前还保证
+	// 恶意输入不会占用任何视频的认领名额。
+	if videoID != "" {
+		if err := idutil.Validate(videoID); err != nil {
+			return nil, err
+		}
+	}
+	if listID != "" {
+		if err := idutil.Validate(listID); err != nil {
+			return nil, err
+		}
 	}
 
 	taskType := modeField
@@ -575,26 +692,26 @@ func (ws *WebServer) nextTaskID(videoID string) string {
 func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
+		ws.writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/status/")
 
 	task, ok := ws.snapshotTask(id)
 	if !ok {
-		writeJSONError(w, http.StatusNotFound, "task not found: "+id)
+		ws.writeJSONError(w, http.StatusNotFound, "task not found: "+id)
 		return
 	}
-	writeJSON(w, http.StatusOK, task)
+	ws.writeJSON(w, http.StatusOK, task)
 }
 
 func (ws *WebServer) handleProgress(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
+		ws.writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
 		return
 	}
-	writeJSON(w, http.StatusOK, ws.snapshotTasks())
+	ws.writeJSON(w, http.StatusOK, ws.snapshotTasks())
 }
 
 // --- 下载流水线 ---
@@ -646,13 +763,34 @@ func (ws *WebServer) runTaskSafely(who string, task *TaskStatus) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[%s] recovered from panic: %v", who, r)
-			ws.mutateTask(task, func(t *TaskStatus) {
-				t.Status = "failed"
-				t.ErrorMessage = fmt.Sprintf("internal error: %v", r)
-			})
+			ws.markTaskFailed(task, fmt.Sprintf("internal error: %v", r))
 		}
 	}()
 	ws.processTask(who, task)
+}
+
+// markTaskFailed 记录失败，并在**单视频任务**上释放认领名额。
+//
+// 为什么必须释放：seen 集合的语义是「本进程已认领」（见 WebServer.seen 注释），
+// 它存在的理由是让**已成功**的视频不被重复下载、让列表重展开保持幂等。
+// 但旧实现只在「入队失败回滚」时调用 unmarkSeen，任务真正失败后认领永不释放，
+// 于是失败的视频在进程剩余生命周期内再提交一律 409 —— 用户唯一的出路是重启进程，
+// 而重启又会丢掉全部任务状态。失败应当可以立即重试，成功才需要长期去重。
+//
+// 列表任务不做释放：列表本身从不被认领（claim = taskType != "list"），而它的
+// VideoID 经归一化后等于 listID，若照此释放，恰好与某个已认领视频同名的列表
+// 就会误删那个视频的认领。区分点只有任务类型，因此集中在这里判一次。
+//
+// 集中成一个方法而不是在各条失败出口各写一遍：漏一处的代价是「某个失败原因
+// 恰好无法重试」，而这种不对称很难从日志里看出来。
+func (ws *WebServer) markTaskFailed(task *TaskStatus, msg string) {
+	ws.mutateTask(task, func(t *TaskStatus) {
+		t.Status = "failed"
+		t.ErrorMessage = msg
+	})
+	if task.Type != "list" {
+		ws.unmarkSeen(task.VideoID)
+	}
 }
 
 func (ws *WebServer) processTask(who string, task *TaskStatus) {
@@ -674,10 +812,7 @@ func (ws *WebServer) processListTask(who string, task *TaskStatus) {
 
 	videos, err := ws.getPlaylist(listID)
 	if err != nil {
-		ws.mutateTask(task, func(t *TaskStatus) {
-			t.Status = "failed"
-			t.ErrorMessage = "获取播放列表失败: " + err.Error()
-		})
+		ws.markTaskFailed(task, "获取播放列表失败: "+err.Error())
 		log.Printf("[%s] Playlist %s failed: %v", who, listID, err)
 		return
 	}
@@ -703,10 +838,7 @@ func (ws *WebServer) processListTask(who string, task *TaskStatus) {
 			ws.untrackTask(child.ID)
 			ws.unmarkSeen(vid)
 			log.Printf("[%s] Playlist %s expansion stopped after %d of %d videos: %v", who, listID, count, len(videos), err)
-			ws.mutateTask(task, func(t *TaskStatus) {
-				t.Status = "failed"
-				t.ErrorMessage = fmt.Sprintf("展开播放列表时入队失败（已入队 %d/%d）: %v", count, len(videos), err)
-			})
+			ws.markTaskFailed(task, fmt.Sprintf("展开播放列表时入队失败（已入队 %d/%d）: %v", count, len(videos), err))
 			return
 		}
 		count++
@@ -727,10 +859,7 @@ func (ws *WebServer) processSingleTask(who string, task *TaskStatus) {
 
 	meta, err := ws.resolveVideoInfo(task.VideoID, task.ListID)
 	if err != nil {
-		ws.mutateTask(task, func(t *TaskStatus) {
-			t.Status = "failed"
-			t.ErrorMessage = "解析视频信息失败: " + err.Error()
-		})
+		ws.markTaskFailed(task, "解析视频信息失败: "+err.Error())
 		log.Printf("[%s] Resolve %s failed: %v", who, task.VideoID, err)
 		return
 	}
@@ -749,10 +878,7 @@ func (ws *WebServer) processSingleTask(who string, task *TaskStatus) {
 
 	// 下载视频
 	if meta.DataURL == "" || meta.VideoFilePath == "" {
-		ws.mutateTask(task, func(t *TaskStatus) {
-			t.Status = "failed"
-			t.ErrorMessage = "未找到视频下载地址"
-		})
+		ws.markTaskFailed(task, "未找到视频下载地址")
 		return
 	}
 
@@ -788,10 +914,7 @@ func (ws *WebServer) processSingleTask(who string, task *TaskStatus) {
 	}
 
 	if dlErr != nil {
-		ws.mutateTask(task, func(t *TaskStatus) {
-			t.Status = "failed"
-			t.ErrorMessage = "视频下载失败: " + dlErr.Error()
-		})
+		ws.markTaskFailed(task, "视频下载失败: "+dlErr.Error())
 		log.Printf("[%s] Video download failed for %s: %v", who, task.VideoID, dlErr)
 		return
 	}

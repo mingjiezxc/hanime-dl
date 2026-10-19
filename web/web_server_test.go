@@ -1090,3 +1090,205 @@ func waitForHTTPReadyLocal(t *testing.T, url string, timeout time.Duration) {
 	}
 	t.Fatalf("web server 未在 %s 内就绪：%s", timeout, url)
 }
+
+// --- Tranche A 安全加固 ---
+
+// TestInvalidIDRejectedWith400 锁住已复现的路径穿越面。
+//
+// 反向证据（回归用例）：修复前这些值会一路走到 cache/info_<id>.json 的拼接，
+// filepath.Join 的 Clean 让 "a/../../b" 变成缓存目录之外的 "b.json"，
+// 于是「写缓存」与「清缓存」成为任意路径写/删。
+// 这里同时锁住两件容易被漏掉的事：非法输入必须**不建任务**、也**不占用认领名额**
+// （否则攻击者可以用一批垃圾 ID 把真实视频永久挡在 409 之外）。
+func TestInvalidIDRejectedWith400(t *testing.T) {
+	ws, _, _ := newTestServer(t, &Options{})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+
+	hostile := []string{
+		`a/../../b`,
+		`../../etc/passwd`,
+		`..`,
+		`.hidden`,
+		`-leading-dash`,
+		`has space`,
+		`a\..\..\b`,
+		`<img src=x onerror=alert(1)>`,
+	}
+	for _, id := range hostile {
+		body, err := json.Marshal(map[string]string{"video_id": id, "type": "single"})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		rec := httptest.NewRecorder()
+		ws.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(string(body))))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("video_id=%q status = %d, want 400; body=%s", id, rec.Code, rec.Body.String())
+			continue
+		}
+		// 400 也必须走统一 JSON 错误契约（前端按 response.json() 解析）。
+		if got := decodeBody[apiError](t, rec.Body.Bytes()); got.Error == "" {
+			t.Errorf("video_id=%q 的错误体缺少 error 字段: %s", id, rec.Body.String())
+		}
+	}
+
+	if n := len(ws.snapshotTasks()); n != 0 {
+		t.Errorf("非法输入后任务数 = %d, want 0", n)
+	}
+	// 认领名额未被占用：同一个字符串之后仍可作为合法提交的前缀？——不能，
+	// 这里改为验证「合法 ID 仍然可用」，证明垃圾输入没有污染 seen。
+	if _, err := ws.createAndDispatchTask(submitCtx(t), "405852", "", "single", ""); err != nil {
+		t.Errorf("合法 ID 提交失败（说明非法输入占用了状态）: %v", err)
+	}
+}
+
+// TestFailedVideoCanBeResubmitted 是 A3 的回归用例。
+//
+// 反向证据：修复前 unmarkSeen 只在「入队失败回滚」时调用，任务失败后认领永不释放，
+// 同一视频再提交恒返回 409，用户只能重启进程（而重启会丢掉全部任务状态）。
+func TestFailedVideoCanBeResubmitted(t *testing.T) {
+	ws, res, _ := newTestServer(t, &Options{MaxWorkers: 1})
+	res.resolve = func(videoID, listID string) (scraper.VideoMetadata, error) {
+		return scraper.VideoMetadata{}, errors.New("boom: 解析失败")
+	}
+	ws.startWorkers()
+
+	first, err := ws.createAndDispatchTask(submitCtx(t), "retry-me", "", "single", "")
+	if err != nil {
+		t.Fatalf("首次提交: %v", err)
+	}
+	if got := waitForTaskStatus(t, ws, first.ID, "failed"); got.Status != "failed" {
+		t.Fatalf("等待失败态得到 %q", got.Status)
+	}
+
+	second, err := ws.createAndDispatchTask(submitCtx(t), "retry-me", "", "single", "")
+	if err != nil {
+		t.Fatalf("失败后重新提交应被接受，实际: %v", err)
+	}
+	if second.ID == first.ID {
+		t.Errorf("重试应产生新任务，而不是复用失败任务 ID")
+	}
+	if n := len(ws.snapshotTasks()); n != 2 {
+		t.Errorf("任务数 = %d, want 2（失败任务保留在列表里供查看）", n)
+	}
+}
+
+// TestCompletedVideoStillDeduplicated 保证 A3 没有把去重一起放开：
+// 成功的视频仍然不能重复下载。
+func TestCompletedVideoStillDeduplicated(t *testing.T) {
+	dir := t.TempDir()
+	ws, res, dl := newTestServer(t, &Options{MaxWorkers: 1})
+	res.resolve = func(videoID, listID string) (scraper.VideoMetadata, error) {
+		return testMeta(dir, videoID), nil
+	}
+	ws.startWorkers()
+
+	if _, err := ws.createAndDispatchTask(submitCtx(t), "done-1", "", "single", ""); err != nil {
+		t.Fatalf("首次提交: %v", err)
+	}
+	waitForTaskStatus(t, ws, "done-1_1", "completed")
+
+	if _, err := ws.createAndDispatchTask(submitCtx(t), "done-1", "", "single", ""); !errors.Is(err, ErrDuplicateVideo) {
+		t.Errorf("已成功的视频重复提交 err = %v, want ErrDuplicateVideo", err)
+	}
+	if n := dl.count(); n != 1 {
+		t.Errorf("下载调用数 = %d, want 1", n)
+	}
+}
+
+// TestSubmitBodySizeLimit 锁住请求体上限：无上限时一个超大 body 就是一次内存压力。
+func TestSubmitBodySizeLimit(t *testing.T) {
+	ws, _, _ := newTestServer(t, &Options{})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+
+	// 合法但远小于上限的 body 必须照常工作。
+	ok := httptest.NewRecorder()
+	ws.Handler().ServeHTTP(ok, httptest.NewRequest(http.MethodPost, "/api/tasks",
+		strings.NewReader(`{"video_id":"small","type":"single"}`)))
+	if ok.Code != http.StatusCreated {
+		t.Fatalf("正常提交 status = %d, want 201", ok.Code)
+	}
+
+	// 构造一个超过上限的 video_id：期望被拒（400），且不得建任务。
+	huge := `{"video_id":"` + strings.Repeat("a", maxSubmitBodyBytes) + `","type":"single"}`
+	rec := httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(huge)))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("超大 body status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	for _, task := range ws.snapshotTasks() {
+		if task.VideoID == "small" && len(task.ID) > 20 {
+			t.Errorf("超大 body 竟被解析成任务: %+v", task)
+		}
+	}
+}
+
+// TestCORSIsSameOriginByDefault 锁住默认不发 Access-Control-Allow-Origin。
+//
+// 反向证据：修复前每个响应都无条件带 `*`，用户浏览器里任意网页都能跨源
+// 向这个能写盘的服务提交任务。
+func TestCORSIsSameOriginByDefault(t *testing.T) {
+	ws, _, _ := newTestServer(t, &Options{})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/progress", nil))
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("默认 Access-Control-Allow-Origin = %q, want 空（同源）", got)
+	}
+}
+
+// TestCORSExplicitOriginOnly 确认配置后只回显那一个来源，而不是 *。
+func TestCORSExplicitOriginOnly(t *testing.T) {
+	ws, _, _ := newTestServer(t, &Options{APIAllowOrigin: "http://localhost:3000"})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/progress", nil))
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:3000" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want http://localhost:3000", got)
+	}
+}
+
+// TestAPITokenGuard 覆盖启用鉴权后的三种情形：缺失、错误、正确。
+// 未启用时（apiToken 为空）行为必须与历史一致——由上面的其它用例隐式覆盖。
+func TestAPITokenGuard(t *testing.T) {
+	ws, _, _ := newTestServer(t, &Options{APIToken: "s3cret"})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+
+	get := func(auth string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/progress", nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		rec := httptest.NewRecorder()
+		ws.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := get(""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("无令牌 status = %d, want 401", rec.Code)
+	}
+	if rec := get("Bearer wrong-token"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("错误令牌 status = %d, want 401", rec.Code)
+	}
+	if rec := get("Bearer s3cret"); rec.Code != http.StatusOK {
+		t.Errorf("正确令牌 status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 401 也必须是统一 JSON 契约（前端按 response.json() 解析）。
+	bad := get("Bearer nope")
+	if !strings.Contains(bad.Header().Get("Content-Type"), "application/json") {
+		t.Errorf("401 Content-Type = %q, want application/json", bad.Header().Get("Content-Type"))
+	}
+	if err := decodeBody[apiError](t, bad.Body.Bytes()); err.Error != ErrUnauthorized.Error() {
+		t.Errorf("401 error = %q, want %q", err.Error, ErrUnauthorized.Error())
+	}
+}

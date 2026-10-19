@@ -17,6 +17,7 @@ import (
 	"github.com/chromedp/chromedp"
 
 	"hanime-dl/chrome"
+	"hanime-dl/internal/idutil"
 )
 
 const (
@@ -130,6 +131,14 @@ func NewScraper(cacheDir, downDir, resolution string) *Scraper {
 // GetPlaylist 获取播放列表（带缓存）。
 // listID 是列表/合集标识（播放列表页里的视频 ID），缓存文件为 list_<listID>.json。
 func (s *Scraper) GetPlaylist(wsURL, listID string) ([]string, error) {
+	// 纵深防御：listID 会拼进 cache/list_<listID>.json，未校验的值经 filepath.Join
+	// 的 Clean 可以逃出缓存目录（见 internal/idutil 的包注释与复现用例）。
+	// 调用方（main / web）已在入口挡过一次，但路径拼接发生在本包，
+	// 所以这条不变量由本包自己保证，不依赖调用方的纪律。
+	if err := idutil.Validate(listID); err != nil {
+		return nil, fmt.Errorf("get playlist: %w", err)
+	}
+
 	// 检查缓存
 	cacheFile := filepath.Join(s.cacheDir, fmt.Sprintf("list_%s.json", listID))
 	if data, err := os.ReadFile(cacheFile); err == nil {
@@ -216,6 +225,16 @@ func (s *Scraper) GetPlaylist(wsURL, listID string) ([]string, error) {
 
 // ResolveVideoInfo 解析视频信息（带缓存）
 func (s *Scraper) ResolveVideoInfo(wsURL, videoID, listID string) (VideoMetadata, error) {
+	// 纵深防御，同 GetPlaylist：videoID 决定 cache/info_<videoID>.json 的位置。
+	if err := idutil.Validate(videoID); err != nil {
+		return VideoMetadata{}, fmt.Errorf("resolve video info: %w", err)
+	}
+	if listID != "" {
+		if err := idutil.Validate(listID); err != nil {
+			return VideoMetadata{}, fmt.Errorf("resolve video info: %w", err)
+		}
+	}
+
 	// 检查缓存
 	cacheFile := filepath.Join(s.cacheDir, fmt.Sprintf("info_%s.json", videoID))
 	if data, err := os.ReadFile(cacheFile); err == nil {
@@ -290,6 +309,11 @@ func (s *Scraper) ResolveVideoInfo(wsURL, videoID, listID string) (VideoMetadata
 
 // RefreshVideoDataURL 刷新视频下载 URL
 func (s *Scraper) RefreshVideoDataURL(wsURL, videoID string) (string, error) {
+	// 纵深防御：刷新直链同样以 videoID 定位缓存与页面 URL。
+	if err := idutil.Validate(videoID); err != nil {
+		return "", fmt.Errorf("refresh data url: %w", err)
+	}
+
 	ctx1, cancel1 := context.WithTimeout(context.Background(), refreshDataURLTimeout)
 	defer cancel1()
 
