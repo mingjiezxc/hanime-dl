@@ -11,29 +11,17 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 
 ---
 
-## 📦 最新版本：v0.4.6 (2026-07-19)
+## 📦 最新版本：v0.4.7 (2026-10-19)
 
-### 新增特性
-- ✨ **Web 管理界面** - 提供可视化的视频下载管理界面
-- 🎨 **现代化 UI** - 基于 HTML/CSS/JavaScript 的响应式设计
-- 📊 **实时进度显示** - 可视化显示下载进度和状态
-- 🔄 **批量操作** - 支持通过 Web 界面批量管理下载任务
+## 🛠️ v0.4.7 审计整改 (2026-10-19)
 
-### 更新内容
-- 重构项目结构，采用模块化设计
-- 新增 `web/` 模块提供 Web 服务器功能
-- 新增 `chrome/` 模块独立 Chrome 浏览器管理
-- 新增 `scraper/` 模块独立网页抓取逻辑
-- 新增 `downloader/` 模块独立文件下载逻辑
-- 新增 `config/` 模块独立配置管理
+针对一次完整的代码审计做了一批修复与工程基线建设。本版本包含以下**破坏性变更**，升级前请留意：
 
-### v0.4.6 修复 (2026-07-19)
-- 🐛 **目录自动创建** - 修复下载时目标父目录（如 `download/<影片名>/`）不存在导致临时文件创建失败的问题，现会在写入前自动 `MkdirAll` 父目录
-- 🐛 **新标签页代替新窗口** - 修复 chromedp 在远程浏览器下每次抓取都会打开「新窗口」的问题，改为在已有浏览器中打开「新标签页」（新增 `chrome.CreateTab()`，`scraper` 通过 `WithTargetID` 附着，任务结束自动关闭标签页）
+- ⚠️ **移除配置项 `DirectDownloadFirst`** - 该字段此前贯穿 `Config`、`web.Options`、`Downloader`
+  全链路却从未被读取，现已删除；旧 `config.yaml` 中若仍保留该键会被静默忽略（`yaml.v3` 不报未知键）
+- ⚠️ **`config.yaml` 不再随仓库分发** - 改为通用占位的 `config.example.yaml`，本机配置已被
+  `.gitignore` 忽略；首次运行会自动生成，或手动 `cp config.example.yaml config.yaml`
 
-## 🛠️ 未发布：审计整改 (unreleased)
-
-针对一次完整的代码审计做了一批修复与工程基线建设。**尚未打标签发布**，
 各项改动分布在 `downloader/`、`scraper/`、`web/`、`chrome/`、`main.go` 与仓库根目录。
 
 - 🔒 **下载落盘完整性** - 下载字节数与 `Content-Length` 不一致时不再把残缺临时文件改名为成品，
@@ -45,10 +33,33 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 - 🖼️ **封面与抓取** - 高清封面搜索不再硬编码单一分类；抽取下载页解析与分辨率选择的重复实现，
   失败时明确回落并打 WARN
 - 🧹 **配置卫生** - `config.yaml` 示例化为 `config.example.yaml`，本机私有配置改为 gitignore；
-  移除从未被读取的无效配置项
-- 🧪 **测试** - 为 `downloader/`、`scraper/` 等模块补齐**离线**单元测试（`httptest` / 纯函数，不依赖 Chrome 与外网）
+  移除从未被读取的无效配置项 `DirectDownloadFirst`
+- 🧪 **测试** - 为 `downloader/`、`scraper/`、`web/`、`main` 补齐**离线**单元测试
+  （`httptest` / 纯函数，不依赖 Chrome 与外网），测试代码约 3000 行
 - 🧰 **工程基线** - 新增 `Makefile`（`build` / `vet` / `fmt` / `fmt-check` / `lint` / `test` / `all`）
   与 `.golangci.yml`（golangci-lint v2.14.0），并记录只读 `GOCACHE` 这一环境陷阱
+- 🛑 **生命周期** - 接入 `signal.NotifyContext` 与优雅停机；修复本地 Chrome 实例与临时 profile
+  目录不回收的进程泄漏；Web API 错误统一为 `{"error","message"}` JSON 契约
+
+### 历史版本：v0.4.6 (2026-07-19)
+
+#### 主要特性
+- ✨ **Web 管理界面** - 提供可视化的视频下载管理界面
+- 🎨 **现代化 UI** - 基于 HTML/CSS/JavaScript 的响应式设计
+- 📊 **实时进度显示** - 可视化显示下载进度和状态
+- 🔄 **批量操作** - 支持通过 Web 界面批量管理下载任务
+
+#### 更新内容
+- 重构项目结构，采用模块化设计
+- 新增 `web/` 模块提供 Web 服务器功能
+- 新增 `chrome/` 模块独立 Chrome 浏览器管理
+- 新增 `scraper/` 模块独立网页抓取逻辑
+- 新增 `downloader/` 模块独立文件下载逻辑
+- 新增 `config/` 模块独立配置管理
+
+#### 修复
+- 🐛 **目录自动创建** - 修复下载时目标父目录（如 `download/<影片名>/`）不存在导致临时文件创建失败的问题，现会在写入前自动 `MkdirAll` 父目录
+- 🐛 **新标签页代替新窗口** - 修复 chromedp 在远程浏览器下每次抓取都会打开「新窗口」的问题，改为在已有浏览器中打开「新标签页」（新增 `chrome.CreateTab()`，`scraper` 通过 `WithTargetID` 附着，任务结束自动关闭标签页）
 
 ## 功能特性
 
@@ -65,6 +76,7 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 ```
 hanime-dl/
 ├── main.go                        # 主程序入口
+├── main_test.go                   # 主流程 / 进度聚合测试（离线）
 ├── config/
 │   └── config.go                  # 配置管理模块
 ├── chrome/
@@ -76,12 +88,15 @@ hanime-dl/
 │   ├── downloader.go              # 文件下载模块
 │   └── downloader_test.go         # 下载模块测试（离线，httptest）
 ├── web/
-│   └── web_server.go              # Web 服务器模块
+│   ├── index.html                 # 内置 Web 界面（打包进二进制）
+│   ├── web_server.go              # Web 服务器模块
+│   └── web_server_test.go         # Web handler / 下载管线测试（离线）
 ├── config.example.yaml            # 配置示例（提交进仓库）
 ├── config.yaml                    # 本机实际配置（首次运行自动生成，已被 .gitignore 忽略）
 ├── Makefile                       # 构建 / 检查 / 测试入口
 ├── .golangci.yml                  # golangci-lint 配置（v2 schema）
 ├── go.mod                         # Go 模块定义
+├── go.sum                         # 依赖校验和
 └── README.md                      # 项目说明
 ```
 
@@ -341,6 +356,11 @@ graph TD
 程序包含完善的错误处理机制：
 
 - **自动重试**: 下载失败时自动重试最多 5 次
+- **完整性校验**: 下载字节数与 `Content-Length` 不一致时保留 `.tmp` 临时文件，**绝不改名成残缺成品**
+- **类型化错误分类**: 410 / 416 等状态码按 `errors.As` 分支处理，不再做错误字符串匹配
+- **重复提交保护**: 同一视频重复提交返回 `409`，同一路径的并发下载串行化
+- **优雅停机**: 收到 `SIGINT` / `SIGTERM` 后停止接收新任务，有界等待在途任务后退出
+- **统一 JSON 错误契约**: Web API 错误统一返回 `{"error","message"}`，前端可直接 `response.json()`
 - **断点续传**: 支持从上次中断的位置继续下载
 - **代理支持**: 支持 HTTP 代理，适用于网络受限环境
 - **分辨率降级**: 请求的分辨率不可用时自动降级到可用分辨率
@@ -409,9 +429,12 @@ MIT License
 
 ## 🇬🇧 English
 
-### Latest Version: v0.4.6 (2026-07-19)
+### Latest Version: v0.4.7 (2026-10-19)
 
 #### What's New
+- 🛡️ **Download integrity** - byte-count validation against `Content-Length`; a truncated `.tmp` is never renamed to the final file
+- 🧪 **Offline test suite** - ~3,000 lines of `httptest` / pure-function tests, plus a `Makefile` and `golangci-lint` baseline
+- ⚠️ **Breaking changes** - `DirectDownloadFirst` removed (it was plumbed through the stack but never read); `config.yaml` is now machine-local and gitignored, ship `config.example.yaml` instead
 - ✨ **Web Management Interface** - Visual video download management
 - 🎨 **Modular Refactoring** - Clean project structure (chrome/, config/, scraper/, downloader/, web/)
 - 📊 **Real-time Progress** - Visual download status
@@ -510,11 +533,11 @@ Access `http://localhost:8080` for:
 - 📊 Real-time download status
 
 #### Releases
-- **unreleased**: Code-audit remediation — download integrity (byte-count validation), segmented/idle
-  timeouts, per-path download mutex, typed HTTP error classification, scraper de-duplication + WARN
-  fallbacks, offline unit tests, `Makefile` + `.golangci.yml` baseline, `config.yaml` → `config.example.yaml`
-  (machine-local config is now gitignored), removal of a never-read download-mode setting that was
-  plumbed through the whole stack but never actually consulted
+- **v0.4.7** (2026-10-19): Code-audit remediation — download integrity (byte-count validation, 206
+  `Content-Range` start verification), segmented/idle timeouts, per-path download mutex, typed HTTP
+  error classification, scraper de-duplication + WARN fallbacks, graceful shutdown, offline unit tests,
+  `Makefile` + `.golangci.yml` baseline, `config.yaml` → `config.example.yaml` (machine-local config is
+  now gitignored), removal of the never-read `DirectDownloadFirst` setting
 - **v0.4.6**: Bug fixes - auto-create download dirs, open new tab instead of new window (`CreateTab`)
 - **v0.4.1**: Modular refactoring, Web interface added
 - **v0.4.0**: Initial modular architecture
