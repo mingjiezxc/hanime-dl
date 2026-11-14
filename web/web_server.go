@@ -498,6 +498,10 @@ func statusForError(err error) int {
 		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrUnauthorized):
 		return http.StatusUnauthorized
+	case errors.Is(err, errTaskNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, errTaskRunning), errors.Is(err, errTaskNotRetryable):
+		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
 	}
@@ -569,26 +573,109 @@ func (ws *WebServer) handleTasks(w http.ResponseWriter, r *http.Request) {
 		ws.writeJSON(w, http.StatusOK, ws.snapshotTasks())
 	case http.MethodPost:
 		ws.dispatchRequest(w, r)
+	case http.MethodDelete:
+		// 批量清理：只删已经结束的任务（completed / failed）。
+		// 进行中的任务不在这里处理，理由同 deleteTask 的注释。
+		removed := ws.deleteFinishedTasks()
+		ws.writeJSON(w, http.StatusOK, map[string]any{"deleted": removed})
 	default:
-		w.Header().Set("Allow", "GET, POST")
+		w.Header().Set("Allow", "GET, POST, DELETE")
 		ws.writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
 	}
 }
 
 func (ws *WebServer) handleTaskByID(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", "GET")
-		ws.writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
+	rest := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
+	// POST /api/tasks/{id}/retry：把失败的任务重新排队。
+	if id, ok := strings.CutSuffix(rest, "/retry"); ok {
+		ws.handleRetry(w, r, id)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
+	id := rest
 
-	task, ok := ws.snapshotTask(id)
-	if !ok {
-		ws.writeJSONError(w, http.StatusNotFound, "task not found: "+id)
-		return
+	switch r.Method {
+	case http.MethodGet:
+		task, ok := ws.snapshotTask(id)
+		if !ok {
+			ws.writeJSONError(w, http.StatusNotFound, "task not found: "+id)
+			return
+		}
+		ws.writeJSON(w, http.StatusOK, task)
+	case http.MethodDelete:
+		if err := ws.deleteTask(id); err != nil {
+			ws.writeJSONError(w, statusForError(err), err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "GET, DELETE")
+		ws.writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
 	}
-	ws.writeJSON(w, http.StatusOK, task)
+}
+
+// errTaskRunning 表示任务仍在队列里或正在下载，此时不允许从任务表中删除。
+var errTaskRunning = errors.New("task is still running")
+
+// errTaskNotFound 表示任务 ID 不在任务表里。
+var errTaskNotFound = errors.New("task not found")
+
+// errTaskNotRetryable 表示任务当前状态不允许重试（只有 failed 的任务可以重试）。
+var errTaskNotRetryable = errors.New("task is not retryable")
+
+// deleteTask 从任务表中移除一个已经结束的任务。
+//
+// 为什么拒绝删除进行中的任务：worker 在出队时就拿到了 *TaskStatus 指针，并且
+// 全程只通过这个指针回写状态。此时把 map 里的条目删掉，只会让进度「隐身」——
+// 下载仍在继续、文件照样落盘，而用户在界面上既看不到也不会收到失败提示，
+// 比不删更难排查。真正要中止下载需要给每个任务加取消信号，那是另一件事。
+//
+// 删除时释放该视频的认领名额：seen 的语义是「本进程已认领」，留着它会让用户
+// 删掉之后重新提交同一个视频时收到 409，而这正是删除最可能的后续动作。
+// 列表任务不释放，理由与 markTaskFailed 中相同（它的 VideoID 归一化后等于 listID）。
+func (ws *WebServer) deleteTask(id string) error {
+	ws.tasksMutex.Lock()
+	task, ok := ws.tasks[id]
+	if !ok {
+		ws.tasksMutex.Unlock()
+		return fmt.Errorf("%w: %s", errTaskNotFound, id)
+	}
+	if task.Status == "pending" || task.Status == "downloading" {
+		ws.tasksMutex.Unlock()
+		return fmt.Errorf("%w: %s", errTaskRunning, id)
+	}
+	videoID, isList := task.VideoID, task.Type == "list"
+	delete(ws.tasks, id)
+	ws.tasksMutex.Unlock()
+
+	if !isList {
+		ws.unmarkSeen(videoID)
+	}
+	log.Printf("Task deleted: id=%s", id)
+	return nil
+}
+
+// deleteFinishedTasks 清空所有已结束的任务，返回删除条数。一次持锁完成，
+// 避免「先快照再逐个删」期间新任务被误删。
+func (ws *WebServer) deleteFinishedTasks() int {
+	ws.tasksMutex.Lock()
+	var gone []TaskStatus
+	for id, t := range ws.tasks {
+		if t.Status == "completed" || t.Status == "failed" {
+			gone = append(gone, *t)
+			delete(ws.tasks, id)
+		}
+	}
+	ws.tasksMutex.Unlock()
+
+	for _, t := range gone {
+		if t.Type != "list" {
+			ws.unmarkSeen(t.VideoID)
+		}
+	}
+	if len(gone) > 0 {
+		log.Printf("Cleared %d finished task(s)", len(gone))
+	}
+	return len(gone)
 }
 
 func (ws *WebServer) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -598,6 +685,130 @@ func (ws *WebServer) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ws.dispatchRequest(w, r)
+}
+
+// handleRetry 处理 POST /api/tasks/{id}/retry。
+func (ws *WebServer) handleRetry(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		ws.writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), TaskEnqueueTimeout)
+	defer cancel()
+
+	task, err := ws.retryTask(ctx, id)
+	if err != nil {
+		ws.writeJSONError(w, statusForError(err), err.Error())
+		return
+	}
+	ws.writeJSON(w, http.StatusOK, task)
+}
+
+// retryTask 把一个 failed 任务重置为 pending 并重新入队，复用同一个任务 ID。
+//
+// 为什么复用 ID 而不是「删掉再建一个」：用户盯着的是这一条记录。换 ID 会让重试
+// 看起来像是又多了一条任务，失败历史也随之消失；复用 ID 后，界面上的卡片原地
+// 从「失败」变回「待处理」，进度条重新从 0 开始走。
+//
+// 「彻底重试」包含三件事，缺一件都会把上次的失败原样重放一遍：
+//  1. 清掉该视频的 info 缓存 —— 缓存里连文件路径一起落盘，旧路径可能非法
+//     （标题含 "|" 之类），不删就会继续写同一个打不开的文件名；
+//  2. 删掉残留的 .tmp —— 下载器默认按 .tmp 续传，留着它会从上次的断点接着写，
+//     而上一次失败往往正是因为那份内容不可信；
+//  3. 重新认领 video_id —— 避免与并发提交的同名视频任务写同一个文件。
+func (ws *WebServer) retryTask(ctx context.Context, id string) (TaskStatus, error) {
+	ws.tasksMutex.Lock()
+	task, ok := ws.tasks[id]
+	if !ok {
+		ws.tasksMutex.Unlock()
+		return TaskStatus{}, fmt.Errorf("%w: %s", errTaskNotFound, id)
+	}
+	if task.Status != "failed" {
+		status := task.Status
+		ws.tasksMutex.Unlock()
+		return TaskStatus{}, fmt.Errorf("%w: %s (status=%s)", errTaskNotRetryable, id, status)
+	}
+	videoID, listID, taskType := task.VideoID, task.ListID, task.Type
+	isList := taskType == "list"
+
+	// 在锁内就把状态改成 pending：连点两次只有一次能通过上面的状态检查，
+	// 另一次会看到 pending 并被拒绝，不会重复入队。
+	task.Status = "pending"
+	task.ErrorMessage = ""
+	task.Progress = 0
+	task.ProgressKnown = false
+	task.Downloaded = 0
+	task.TotalSize = 0
+	task.CompletedAt = nil
+	ws.tasksMutex.Unlock()
+
+	// 失败时 markTaskFailed 已经释放过认领，这里重新占上。
+	if !isList && !ws.markSeen(videoID) {
+		ws.mutateTask(task, func(t *TaskStatus) {
+			t.Status = "failed"
+			t.ErrorMessage = "该视频已有其他任务在队列中，无法重试"
+		})
+		return TaskStatus{}, fmt.Errorf("%w: %s", ErrDuplicateVideo, videoID)
+	}
+
+	ws.prepareRetryArtifacts(videoID, taskType)
+
+	if err := ws.enqueue(ctx, task); err != nil {
+		if !isList {
+			ws.unmarkSeen(videoID)
+		}
+		// 入队失败要把状态退回 failed，否则这个任务会永远停在 pending，
+		// 用户既看不到失败原因，也没有重试入口。
+		ws.mutateTask(task, func(t *TaskStatus) {
+			t.Status = "failed"
+			t.ErrorMessage = "重新入队失败: " + err.Error()
+		})
+		return TaskStatus{}, err
+	}
+
+	log.Printf("Task retried: id=%s video=%s list=%s", id, videoID, listID)
+	snap, _ := ws.snapshotTask(id)
+	return snap, nil
+}
+
+// prepareRetryArtifacts 清掉会让「重试」变成「重放旧失败」的本地状态。
+func (ws *WebServer) prepareRetryArtifacts(videoID, taskType string) {
+	if videoID == "" {
+		return
+	}
+	if taskType == "list" {
+		// 列表任务的缓存是「展开结果」：删掉它，重试才会重新抓一次列表页。
+		removeIfExists(filepath.Join(ws.cacheDir, fmt.Sprintf("list_%s.json", videoID)))
+		return
+	}
+
+	infoFile := filepath.Join(ws.cacheDir, fmt.Sprintf("info_%s.json", videoID))
+	// 先从缓存里取出上一次的文件路径，才能找到与它并存的 .tmp；
+	// 缓存文件本身随后也要删：它连路径一起缓存，可能正是非法路径的来源。
+	if data, err := os.ReadFile(infoFile); err == nil {
+		var meta scraper.VideoMetadata
+		if err := json.Unmarshal(data, &meta); err == nil && meta.VideoFilePath != "" {
+			removeIfExists(meta.VideoFilePath + ".tmp")
+		}
+	}
+	removeIfExists(infoFile)
+}
+
+// removeIfExists 删除文件，忽略「本来就不存在」；其它错误只记日志不打断重试。
+func removeIfExists(path string) {
+	if path == "" {
+		return
+	}
+	err := os.Remove(path)
+	switch {
+	case err == nil:
+		log.Printf("Retry cleanup: removed %s", path)
+	case os.IsNotExist(err):
+		// 第一次就失败时什么都没落盘，这是最常见的情况，不需要日志。
+	default:
+		log.Printf("Retry cleanup: failed to remove %s: %v", path, err)
+	}
 }
 
 // createAndDispatchTask 创建任务、加入任务表并按背压推入队列。
