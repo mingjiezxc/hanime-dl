@@ -241,6 +241,15 @@ func (s *Scraper) ResolveVideoInfo(wsURL, videoID, listID string) (VideoMetadata
 		var cachedMeta VideoMetadata
 		if err := json.Unmarshal(data, &cachedMeta); err == nil {
 			log.Printf("Loaded info for %s from cache", videoID)
+			// 旧版本写下的缓存连文件路径一起落盘，而命名规则会随修复演进
+			// （例如把 Windows 非法字符 "|" 换成全角）。只更新代码不清缓存，
+			// 命中缓存就会原样重放上一次的失败。这里做一次「读时修正」。
+			if fixed, changed := repairMediaPaths(s.downDir, cachedMeta); changed {
+				log.Printf("Repaired stale media path for %s: %q -> %q", videoID, cachedMeta.VideoFilePath, fixed.VideoFilePath)
+				fixed.ListID = ""
+				writeJSONFile(cacheFile, fixed)
+				cachedMeta = fixed
+			}
 			// 缓存语义：info_<id>.json 只保存与列表无关的字段，ListID 不属于缓存内容
 			// （见写入处的同款说明）。归属完全由调用方通过入参决定，
 			// 这样同一视频被多个列表复用时，归属不会随缓存内容而漂移。
@@ -571,15 +580,89 @@ func dirNameFromTitle(title string) string {
 	if dirName == "" {
 		dirName = strings.Split(t, " ")[0]
 	}
-	dirName = strings.ReplaceAll(dirName, "/", "_")
-	dirName = strings.ReplaceAll(dirName, "\\", "_")
+	// 目录名与文件名一样最终落在 Windows 上，非法字符规则完全一致：
+	// 例如标题 "[Custom|Udon] 某某" 的方括号前缀里带 "|"，直接 MkdirAll 就会失败。
+	// 空标题保持返回空串（由调用方决定如何兜底）。
+	if dirName != "" {
+		dirName = sanitizeFileName(dirName)
+	}
 	return dirName
 }
 
-// sanitizeFileName 把标题转成文件基础名（替换路径分隔符）。
+// fallbackBaseName 是标题清洗后为空时的兜底文件名。
+const fallbackBaseName = "video"
+
+// windowsIllegalNameChars 把 Windows 文件名中不允许出现的字符换成对应的全角字符。
+//
+// 为什么必须换而不是原样保留：这些字符会让 os.Create / os.OpenFile 直接失败，
+// 报错是 `The filename, directory name, or volume label syntax is incorrect.`，
+// 而且发生在第一次写 .tmp 的时刻 —— 界面上看到的却是「视频下载失败」，与网络毫无关系。
+// 已复现：标题 `[Custom Udon] Movie | ひみつ` 里的 "|" 让视频 91045 每次都在
+// 建临时文件时失败，重试多少次都一样。
+//
+// 选择全角字符而不是一律换成 "_"：全角版本在视觉上保留原意（yt-dlp 的
+// --windows-filenames 也是这个思路），用户仍能一眼认出这是原标题。
+// 路径分隔符 / 与 \ 不在这里处理 —— 它们由调用方先换成 "_"，避免生成子目录。
+var windowsIllegalNameChars = strings.NewReplacer(
+	"<", "＜",
+	">", "＞",
+	":", "：",
+	`"`, "＂",
+	"|", "｜",
+	"?", "？",
+	"*", "＊",
+)
+
+// sanitizeFileName 把标题转成 Windows 可用的文件名基础名。
+//
+// 处理顺序：路径分隔符 → Windows 非法字符 → 控制字符 → 结尾的 "." 与空格 →
+// 空串兜底 → 保留设备名。少任何一步都可能让 open() 失败或让实际落盘的文件名
+// 与算出来的路径不一致（Windows 会静默吃掉结尾的 "." 和空格）。
 func sanitizeFileName(title string) string {
 	s := strings.ReplaceAll(title, "/", "_")
-	return strings.ReplaceAll(s, "\\", "_")
+	s = strings.ReplaceAll(s, "\\", "_")
+	s = windowsIllegalNameChars.Replace(s)
+	// 控制字符（0x00-0x1F）同样非法，而且不可见：统一压成 "_" 才能从日志里看出来。
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 {
+			return '_'
+		}
+		return r
+	}, s)
+	// Windows 会静默去掉结尾的 "." 与空格，于是「算出来的路径」≠「真正的文件名」，
+	// 后续的 fileExists 判断就永远为假。这里主动去掉，让两者一致。
+	s = strings.TrimRight(s, " .")
+	if s == "" {
+		return fallbackBaseName
+	}
+	if isWindowsReservedName(s) {
+		// 设备名（CON、NUL、COM1...）在 Windows 上与扩展名无关地解析成设备，
+		// 加一个下划线就能落回普通文件。
+		s += "_"
+	}
+	return s
+}
+
+// isWindowsReservedName 判断 name 是否命中 Windows 保留设备名。
+//
+// 判定按「第一个 "." 之前的部分」进行：Windows 对 CON.txt 的处理与 CON 相同。
+func isWindowsReservedName(name string) bool {
+	stem := name
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	stem = strings.ToUpper(strings.TrimRight(stem, " "))
+	switch stem {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+		return true
+	}
+	if len(stem) == 4 && stem[3] >= '0' && stem[3] <= '9' {
+		switch stem[:3] {
+		case "COM", "LPT":
+			return true
+		}
+	}
+	return false
 }
 
 // buildMediaFilePaths 在 fullDir 下按 title 生成图片与视频的完整路径。
@@ -589,6 +672,35 @@ func buildMediaFilePaths(fullDir, title string) (imagePath, videoPath string) {
 	imagePath = filepath.Join(fullDir, truncateFilename(fullDir, base, ".jpg", maxBaseNameBytes))
 	videoPath = filepath.Join(fullDir, truncateFilename(fullDir, base, ".mp4", maxBaseNameBytes))
 	return imagePath, videoPath
+}
+
+// repairMediaPaths 按当前命名规则重算缓存里的目标目录与文件路径。
+//
+// 存在的理由：缓存（cache/info_<id>.json）把 TargetDir / ImageFilePath /
+// VideoFilePath 一起落盘了，而命名规则会随修复演进（典型例子：把 Windows 非法
+// 字符换成全角）。旧缓存不会因为二进制更新而自动变干净 —— 只要命中缓存，
+// 就会拿着旧路径去 open()，把上次的失败一字不差地重放一遍。
+//
+// 只在与现有规则不一致时才返回 changed=true，调用方据此决定是否写回缓存。
+// 目录创建失败时保持原值：让上层按原路径去尝试，错误信息仍然可读。
+func repairMediaPaths(downDir string, meta VideoMetadata) (VideoMetadata, bool) {
+	title := strings.TrimSpace(meta.Title)
+	// 没有标题就推不出路径；downDir 为空说明调用方未配置目录，同样不动。
+	if title == "" || downDir == "" {
+		return meta, false
+	}
+	dir := filepath.Join(downDir, dirNameFromTitle(title))
+	imagePath, videoPath := buildMediaFilePaths(dir, title)
+	if dir == meta.TargetDir && imagePath == meta.ImageFilePath && videoPath == meta.VideoFilePath {
+		return meta, false
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return meta, false
+	}
+	meta.TargetDir = dir
+	meta.ImageFilePath = imagePath
+	meta.VideoFilePath = videoPath
+	return meta, true
 }
 
 // truncateFilename 在保留扩展名的前提下截断文件名基础名，返回完整的文件名（base+ext）。

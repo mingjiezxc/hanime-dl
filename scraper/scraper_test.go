@@ -185,6 +185,8 @@ func TestDirNameFromTitle(t *testing.T) {
 		{name: "空标题返回空串", title: "", want: ""},
 		{name: "纯空白返回空串", title: "   ", want: ""},
 		{name: "括号内含斜杠一并替换", title: "(A/B) 作品", want: "(A_B)"},
+		// 目录名最终也是 Windows 路径的一段，非法字符规则与文件名完全一致。
+		{name: "括号内含竖线一并替换", title: "[Custom|Udon] 某某", want: "[Custom｜Udon]"},
 	}
 
 	for _, tt := range tests {
@@ -197,11 +199,96 @@ func TestDirNameFromTitle(t *testing.T) {
 }
 
 func TestSanitizeFileName(t *testing.T) {
-	if got, want := sanitizeFileName(`a/b\c`), "a_b_c"; got != want {
-		t.Fatalf("sanitizeFileName() = %q, want %q", got, want)
+	tests := []struct {
+		name  string
+		title string
+		want  string
+	}{
+		{name: "路径分隔符换成下划线", title: `a/b\c`, want: "a_b_c"},
+		{name: "中文原样保留", title: "普通 名字", want: "普通 名字"},
+		// 回归用例：标题里的 "|" 让视频 91045 每次都在建 .tmp 时失败，
+		// 报错是 Windows 的 "The filename, directory name, or volume label syntax
+		// is incorrect."，界面上却显示成「视频下载失败」。
+		{name: "竖线换成全角", title: "[Custom Udon] Movie | ひみつ", want: "[Custom Udon] Movie ｜ ひみつ"},
+		{name: "其余非法字符一并换掉", title: `a<b>c:d"e?f*g`, want: "a＜b＞c：d＂e？f＊g"},
+		{name: "控制字符换成下划线", title: "a\x00b\x1fc", want: "a_b_c"},
+		{name: "结尾的点与空格被裁掉", title: "某某作品 ... ", want: "某某作品"},
+		{name: "全是点与空格时兜底", title: " . . ", want: fallbackBaseName},
+		{name: "保留设备名加下划线", title: "CON", want: "CON_"},
+		{name: "保留设备名大小写不敏感", title: "com1", want: "com1_"},
+		{name: "普通名字不受设备名规则影响", title: "COM10 x", want: "COM10 x"},
 	}
-	if got, want := sanitizeFileName("普通 名字"), "普通 名字"; got != want {
-		t.Fatalf("sanitizeFileName() = %q, want %q", got, want)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeFileName(tt.title); got != tt.want {
+				t.Fatalf("sanitizeFileName(%q) = %q, want %q", tt.title, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSanitizedFileNameIsActuallyWritable 用真实文件系统验证清洗结果。
+//
+// 前面的表驱动测试只能证明「字符串里没有非法字符」，这里进一步证明「真的能落盘」——
+// Windows 上这两件事之间还有路径长度、保留设备名等平台行为，只有真的 os.Create
+// 才能证明用户不会再看到那句 syntax is incorrect。
+func TestSanitizedFileNameIsActuallyWritable(t *testing.T) {
+	dir := t.TempDir()
+	titles := []string{
+		"[Custom Udon] Movie | ひみつ",
+		`A: B? C* D" E< F> G`,
+		"  前后空白与结尾点 ... ",
+		"CON",
+		"控制\x00字符\x1f测试",
+	}
+	for _, title := range titles {
+		imgPath, videoPath := buildMediaFilePaths(dir, title)
+		for _, p := range []string{imgPath, videoPath} {
+			f, err := os.Create(p)
+			if err != nil {
+				t.Fatalf("标题 %q 生成的路径无法创建文件：%v（path=%q）", title, err, p)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatalf("关闭 %q 失败：%v", p, err)
+			}
+		}
+	}
+}
+
+// TestRepairMediaPathsFixesStaleCachePath 保证旧缓存里的非法路径会被读时修正。
+//
+// 反向证据：只改 sanitizeFileName 而不修缓存，用户重试时仍会命中
+// cache/info_91045.json 里存着的旧路径，把同一个失败原样重放一遍。
+func TestRepairMediaPathsFixesStaleCachePath(t *testing.T) {
+	dir := t.TempDir()
+	title := "[Custom Udon] Movie | ひみつ"
+	sub := filepath.Join(dir, "[Custom Udon]")
+	stale := VideoMetadata{
+		VideoID:       "91045",
+		Title:         title,
+		TargetDir:     sub,
+		ImageFilePath: filepath.Join(sub, "[Custom Udon] Movie | ひみつ.jpg"),
+		VideoFilePath: filepath.Join(sub, "[Custom Udon] Movie | ひみつ.mp4"),
+	}
+
+	fixed, changed := repairMediaPaths(dir, stale)
+	if !changed {
+		t.Fatal("旧的非法路径应被判为需要修正")
+	}
+	if got := filepath.Base(fixed.VideoFilePath); strings.ContainsAny(got, `<>:"|?*`) {
+		t.Fatalf("修正后的文件名仍含 Windows 非法字符：%q", got)
+	}
+	if _, err := os.Stat(fixed.TargetDir); err != nil {
+		t.Fatalf("修正时应补齐目标目录：%v", err)
+	}
+	if _, changedAgain := repairMediaPaths(dir, fixed); changedAgain {
+		t.Fatal("已修正的元数据再次修正应当是无操作")
+	}
+
+	// 标题缺失时推不出路径，必须原样返回，避免把缓存里的有效路径抹成空。
+	if _, changed := repairMediaPaths(dir, VideoMetadata{VideoID: "x"}); changed {
+		t.Fatal("没有标题时不应修改元数据")
 	}
 }
 
