@@ -331,9 +331,9 @@ func TestHandleTasksErrorsAreJSON(t *testing.T) {
 		{name: "空白 ID 视为空", method: http.MethodPost, path: "/api/tasks", body: `{"video_id":"  ","list_id":"\t"}`, wantStatus: http.StatusBadRequest},
 		{name: "任务不存在", method: http.MethodGet, path: "/api/tasks/nope", wantStatus: http.StatusNotFound},
 		{name: "状态任务不存在", method: http.MethodGet, path: "/api/status/nope", wantStatus: http.StatusNotFound},
-		{name: "不支持的方法", method: http.MethodDelete, path: "/api/tasks", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, POST"},
+		{name: "不支持的方法", method: http.MethodPut, path: "/api/tasks", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, POST, DELETE"},
 		{name: "submit 非 POST", method: http.MethodGet, path: "/api/submit", wantStatus: http.StatusMethodNotAllowed, wantAllow: "POST"},
-		{name: "按 ID 查询非 GET", method: http.MethodPost, path: "/api/tasks/x", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET"},
+		{name: "按 ID 查询非 GET", method: http.MethodPost, path: "/api/tasks/x", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, DELETE"},
 		{name: "progress 非 GET", method: http.MethodPost, path: "/api/progress", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET"},
 	}
 
@@ -1290,5 +1290,231 @@ func TestAPITokenGuard(t *testing.T) {
 	}
 	if err := decodeBody[apiError](t, bad.Body.Bytes()); err.Error != ErrUnauthorized.Error() {
 		t.Errorf("401 error = %q, want %q", err.Error, ErrUnauthorized.Error())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 任务删除（DELETE /api/tasks/{id} 与 DELETE /api/tasks）
+// ---------------------------------------------------------------------------
+
+// doRequest 发一个请求并返回响应记录，省掉每个用例重复的样板。
+func doRequest(t *testing.T, ws *WebServer, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+	return rec
+}
+
+func TestDeleteFinishedTaskReleasesClaim(t *testing.T) {
+	// 删除一个已完成的任务：应当 204、从任务表消失，并且释放该视频的认领名额，
+	// 否则用户删掉之后重新提交同一个视频会拿到 409（删除最可能的后续动作就是重下）。
+	ws, _, _ := newTestServer(t, &Options{})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+	if !ws.markSeen("del-vid-1") {
+		t.Fatal("前置条件失败：del-vid-1 应当尚未被认领")
+	}
+	ws.tasks["del-1"] = &TaskStatus{ID: "del-1", Type: "single", VideoID: "del-vid-1", Status: "completed"}
+
+	if rec := doRequest(t, ws, http.MethodDelete, "/api/tasks/del-1"); rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, ok := ws.snapshotTask("del-1"); ok {
+		t.Fatal("删除后任务仍在任务表里")
+	}
+	if !ws.markSeen("del-vid-1") {
+		t.Fatal("删除后应释放认领，允许重新提交同一个视频")
+	}
+}
+
+func TestDeleteRunningTaskRejected(t *testing.T) {
+	// 进行中的任务必须拒绝删除：worker 仍持有该指针并在写盘，删掉只会让进度隐身。
+	for _, status := range []string{"pending", "downloading"} {
+		t.Run(status, func(t *testing.T) {
+			ws, _, _ := newTestServer(t, &Options{})
+			if err := ws.SetupRoutes(); err != nil {
+				t.Fatalf("SetupRoutes: %v", err)
+			}
+			ws.tasks["run-1"] = &TaskStatus{ID: "run-1", Type: "single", VideoID: "run-vid", Status: status}
+
+			rec := doRequest(t, ws, http.MethodDelete, "/api/tasks/run-1")
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+			}
+			if _, ok := ws.snapshotTask("run-1"); !ok {
+				t.Fatal("被拒绝删除的任务不应从任务表消失")
+			}
+		})
+	}
+}
+
+func TestDeleteMissingTaskReturns404(t *testing.T) {
+	ws, _, _ := newTestServer(t, &Options{})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+	rec := doRequest(t, ws, http.MethodDelete, "/api/tasks/not-there")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	if err := decodeBody[apiError](t, rec.Body.Bytes()); err.Error == "" {
+		t.Errorf("404 应返回 JSON 错误体，实际为空")
+	}
+}
+
+func TestClearFinishedTasksKeepsRunning(t *testing.T) {
+	// 批量清理只应删掉 completed / failed，进行中的任务必须保留。
+	ws, _, _ := newTestServer(t, &Options{})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+	ws.tasks["c1"] = &TaskStatus{ID: "c1", Type: "single", VideoID: "v-c1", Status: "completed"}
+	ws.tasks["c2"] = &TaskStatus{ID: "c2", Type: "single", VideoID: "v-c2", Status: "failed"}
+	ws.tasks["c3"] = &TaskStatus{ID: "c3", Type: "single", VideoID: "v-c3", Status: "downloading"}
+
+	rec := doRequest(t, ws, http.MethodDelete, "/api/tasks")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeBody[struct {
+		Deleted int `json:"deleted"`
+	}](t, rec.Body.Bytes()).Deleted; got != 2 {
+		t.Errorf("deleted = %d, want 2", got)
+	}
+	if _, ok := ws.snapshotTask("c3"); !ok {
+		t.Error("进行中的任务不应被批量清理删掉")
+	}
+	if _, ok := ws.snapshotTask("c1"); ok {
+		t.Error("已完成任务应被删掉")
+	}
+}
+
+// --- 重试 ---
+
+// TestRetryFailedTaskRequeuesSameID 覆盖「失败任务一键重试」的完整链路：
+// 同一个任务 ID 原地回到 pending，重新解析并下载，最终 completed。
+func TestRetryFailedTaskRequeuesSameID(t *testing.T) {
+	dir := t.TempDir()
+	ws, res, dl := newTestServer(t, &Options{MaxWorkers: 1, CacheDir: dir, DownDir: dir})
+
+	var mu sync.Mutex
+	calls := 0
+	res.resolve = func(videoID, listID string) (scraper.VideoMetadata, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			return scraper.VideoMetadata{}, errors.New("boom: 第一次解析失败")
+		}
+		return testMeta(dir, videoID), nil
+	}
+	ws.startWorkers()
+
+	task, err := ws.createAndDispatchTask(submitCtx(t), "retry-vid", "", "single", "")
+	if err != nil {
+		t.Fatalf("提交: %v", err)
+	}
+	waitForTaskStatus(t, ws, task.ID, "failed")
+
+	// 前置条件：模拟上一次失败留下的 info 缓存与 .tmp 残留，重试必须把它们清掉，
+	// 否则「重试」只是把旧失败重放一遍。
+	leftover := filepath.Join(dir, "leftover.mp4")
+	cacheFile := filepath.Join(dir, "info_retry-vid.json")
+	cacheJSON, err := json.Marshal(scraper.VideoMetadata{
+		VideoID:       "retry-vid",
+		Title:         "stale",
+		VideoFilePath: leftover,
+	})
+	if err != nil {
+		t.Fatalf("序列化缓存: %v", err)
+	}
+	if err := os.WriteFile(cacheFile, cacheJSON, 0o644); err != nil {
+		t.Fatalf("写缓存: %v", err)
+	}
+	if err := os.WriteFile(leftover+".tmp", []byte("partial"), 0o644); err != nil {
+		t.Fatalf("写残留 .tmp: %v", err)
+	}
+
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+	rec := doRequest(t, ws, http.MethodPost, "/api/tasks/"+task.ID+"/retry")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeBody[TaskStatus](t, rec.Body.Bytes()); got.ID != task.ID {
+		t.Errorf("重试应复用同一个任务 ID：got %q, want %q", got.ID, task.ID)
+	}
+	if _, err := os.Stat(cacheFile); !os.IsNotExist(err) {
+		t.Errorf("重试应删除 info 缓存（否则会继续用旧路径），stat err = %v", err)
+	}
+	if _, err := os.Stat(leftover + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("重试应删除残留的 .tmp（否则会续传上次的坏数据），stat err = %v", err)
+	}
+	if ws.markSeen("retry-vid") {
+		t.Error("重试后应重新认领该视频，避免并发写同一个文件")
+	}
+
+	final := waitForTaskStatus(t, ws, task.ID, "completed")
+	if final.Progress != 100 {
+		t.Errorf("重试完成后进度 = %d, want 100", final.Progress)
+	}
+	if final.ErrorMessage != "" {
+		t.Errorf("重试成功后不应残留错误信息：%q", final.ErrorMessage)
+	}
+	if n := dl.count(); n != 1 {
+		t.Errorf("下载调用数 = %d, want 1（第一次解析就失败，没有下载）", n)
+	}
+	if n := len(ws.snapshotTasks()); n != 1 {
+		t.Errorf("任务数 = %d, want 1（重试不应产生新记录）", n)
+	}
+}
+
+// TestRetryRejectedUnlessFailed 锁住「只有失败的任务能重试」。
+func TestRetryRejectedUnlessFailed(t *testing.T) {
+	for _, status := range []string{"pending", "downloading", "completed"} {
+		t.Run(status, func(t *testing.T) {
+			ws, _, _ := newTestServer(t, &Options{})
+			if err := ws.SetupRoutes(); err != nil {
+				t.Fatalf("SetupRoutes: %v", err)
+			}
+			ws.tasks["t1"] = &TaskStatus{ID: "t1", Type: "single", VideoID: "v1", Status: status}
+
+			rec := doRequest(t, ws, http.MethodPost, "/api/tasks/t1/retry")
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+			}
+			if got, _ := ws.snapshotTask("t1"); got.Status != status {
+				t.Errorf("被拒绝的重试改了任务状态：%q -> %q", status, got.Status)
+			}
+		})
+	}
+}
+
+// TestRetryMissingTaskReturns404 与 TestRetryMethodNotAllowed 覆盖其余边界。
+func TestRetryMissingTaskReturns404(t *testing.T) {
+	ws, _, _ := newTestServer(t, &Options{})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+	if rec := doRequest(t, ws, http.MethodPost, "/api/tasks/nope/retry"); rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRetryMethodNotAllowed(t *testing.T) {
+	ws, _, _ := newTestServer(t, &Options{})
+	if err := ws.SetupRoutes(); err != nil {
+		t.Fatalf("SetupRoutes: %v", err)
+	}
+	ws.tasks["t1"] = &TaskStatus{ID: "t1", Type: "single", VideoID: "v1", Status: "failed"}
+	rec := doRequest(t, ws, http.MethodGet, "/api/tasks/t1/retry")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Allow"); got != "POST" {
+		t.Errorf("Allow = %q, want POST", got)
 	}
 }
