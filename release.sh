@@ -125,7 +125,13 @@ echo "🛠️  正在为 Linux, Windows, macOS (amd64 + arm64) 交叉编译..."
 
 build_one() {
   local goos="$1" goarch="$2" ext="$3"
-  local out="${RELEASE_DIR}/${APP_NAME}-${goos}-${goarch}${ext}"
+  # 产物文件名用 macos 而不是 GOOS 的 darwin：打包与清理步骤按 macos 命名，
+  # 历史 Release 资产（v0.4.7 及之前）也是 macos-*，改名会让 tar 找不到文件。
+  local label="$goos"
+  if [ "$goos" = "darwin" ]; then
+    label="macos"
+  fi
+  local out="${RELEASE_DIR}/${APP_NAME}-${label}-${goarch}${ext}"
   if GOOS="$goos" GOARCH="$goarch" go build -ldflags="$LDFLAGS" -o "$out" .; then
     echo "  ✓ ${goos}/${goarch}${ext}"
   else
