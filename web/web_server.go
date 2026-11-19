@@ -658,10 +658,12 @@ func (ws *WebServer) deleteTask(id string) error {
 // 避免「先快照再逐个删」期间新任务被误删。
 func (ws *WebServer) deleteFinishedTasks() int {
 	ws.tasksMutex.Lock()
-	var gone []TaskStatus
+	// 收集指针而非值拷贝：TaskStatus 176 字节，逐个复制会触发 rangeValCopy，
+	// 且 map 里本来就存的是 *TaskStatus，delete 只删条目、不回收结构体。
+	var gone []*TaskStatus
 	for id, t := range ws.tasks {
 		if t.Status == "completed" || t.Status == "failed" {
-			gone = append(gone, *t)
+			gone = append(gone, t)
 			delete(ws.tasks, id)
 		}
 	}

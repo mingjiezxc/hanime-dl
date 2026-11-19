@@ -244,11 +244,11 @@ func (s *Scraper) ResolveVideoInfo(wsURL, videoID, listID string) (VideoMetadata
 			// 旧版本写下的缓存连文件路径一起落盘，而命名规则会随修复演进
 			// （例如把 Windows 非法字符 "|" 换成全角）。只更新代码不清缓存，
 			// 命中缓存就会原样重放上一次的失败。这里做一次「读时修正」。
-			if fixed, changed := repairMediaPaths(s.downDir, cachedMeta); changed {
-				log.Printf("Repaired stale media path for %s: %q -> %q", videoID, cachedMeta.VideoFilePath, fixed.VideoFilePath)
-				fixed.ListID = ""
-				writeJSONFile(cacheFile, fixed)
-				cachedMeta = fixed
+			oldVideoPath := cachedMeta.VideoFilePath
+			if repairMediaPaths(s.downDir, &cachedMeta) {
+				log.Printf("Repaired stale media path for %s: %q -> %q", videoID, oldVideoPath, cachedMeta.VideoFilePath)
+				cachedMeta.ListID = ""
+				writeJSONFile(cacheFile, cachedMeta)
 			}
 			// 缓存语义：info_<id>.json 只保存与列表无关的字段，ListID 不属于缓存内容
 			// （见写入处的同款说明）。归属完全由调用方通过入参决定，
@@ -681,26 +681,27 @@ func buildMediaFilePaths(fullDir, title string) (imagePath, videoPath string) {
 // 字符换成全角）。旧缓存不会因为二进制更新而自动变干净 —— 只要命中缓存，
 // 就会拿着旧路径去 open()，把上次的失败一字不差地重放一遍。
 //
-// 只在与现有规则不一致时才返回 changed=true，调用方据此决定是否写回缓存。
+// 只在与现有规则不一致时才原地修改并返回 true，调用方据此决定是否写回缓存。
 // 目录创建失败时保持原值：让上层按原路径去尝试，错误信息仍然可读。
-func repairMediaPaths(downDir string, meta VideoMetadata) (VideoMetadata, bool) {
+// 参数用指针：VideoMetadata 是 128 字节的大结构，值传递会整份拷贝（gocritic hugeParam）。
+func repairMediaPaths(downDir string, meta *VideoMetadata) bool {
 	title := strings.TrimSpace(meta.Title)
 	// 没有标题就推不出路径；downDir 为空说明调用方未配置目录，同样不动。
 	if title == "" || downDir == "" {
-		return meta, false
+		return false
 	}
 	dir := filepath.Join(downDir, dirNameFromTitle(title))
 	imagePath, videoPath := buildMediaFilePaths(dir, title)
 	if dir == meta.TargetDir && imagePath == meta.ImageFilePath && videoPath == meta.VideoFilePath {
-		return meta, false
+		return false
 	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return meta, false
+		return false
 	}
 	meta.TargetDir = dir
 	meta.ImageFilePath = imagePath
 	meta.VideoFilePath = videoPath
-	return meta, true
+	return true
 }
 
 // truncateFilename 在保留扩展名的前提下截断文件名基础名，返回完整的文件名（base+ext）。

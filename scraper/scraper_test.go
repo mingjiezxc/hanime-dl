@@ -272,23 +272,26 @@ func TestRepairMediaPathsFixesStaleCachePath(t *testing.T) {
 		VideoFilePath: filepath.Join(sub, "[Custom Udon] Movie | ひみつ.mp4"),
 	}
 
-	fixed, changed := repairMediaPaths(dir, stale)
-	if !changed {
+	if !repairMediaPaths(dir, &stale) {
 		t.Fatal("旧的非法路径应被判为需要修正")
 	}
-	if got := filepath.Base(fixed.VideoFilePath); strings.ContainsAny(got, `<>:"|?*`) {
+	if got := filepath.Base(stale.VideoFilePath); strings.ContainsAny(got, `<>:"|?*`) {
 		t.Fatalf("修正后的文件名仍含 Windows 非法字符：%q", got)
 	}
-	if _, err := os.Stat(fixed.TargetDir); err != nil {
+	if _, err := os.Stat(stale.TargetDir); err != nil {
 		t.Fatalf("修正时应补齐目标目录：%v", err)
 	}
-	if _, changedAgain := repairMediaPaths(dir, fixed); changedAgain {
+	if repairMediaPaths(dir, &stale) {
 		t.Fatal("已修正的元数据再次修正应当是无操作")
 	}
 
 	// 标题缺失时推不出路径，必须原样返回，避免把缓存里的有效路径抹成空。
-	if _, changed := repairMediaPaths(dir, VideoMetadata{VideoID: "x"}); changed {
+	untitled := VideoMetadata{VideoID: "x"}
+	if repairMediaPaths(dir, &untitled) {
 		t.Fatal("没有标题时不应修改元数据")
+	}
+	if untitled.TargetDir != "" || untitled.ImageFilePath != "" || untitled.VideoFilePath != "" {
+		t.Fatalf("没有标题时不应改动路径字段：%+v", untitled)
 	}
 }
 
