@@ -11,7 +11,9 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 
 ---
 
-## 🔒 安全加固（v0.4.7 之后，尚未发布）
+## 📦 最新版本：v0.4.8 (2026-11-19)
+
+## 🔒 v0.4.8 安全加固 (2026-11-19)
 
 一次以「已复现的缺陷」为准的安全与数据正确性整改。下列每一项都有对应的**回归测试**
 （即：改动前该用例必然失败），不是凭印象的重构。
@@ -45,7 +47,7 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
   绿色基线不再只靠本地手动维持
 - 📄 **LICENSE** - README 一直声称 MIT 但仓库里没有 `LICENSE` 文件，现已补上
 
-## 🛠️ 未发布改动：Windows 文件名与任务列表操作
+## 🛠️ v0.4.8 Windows 文件名与任务列表操作 (2026-11-19)
 
 - 🖥️ **标题含 Windows 非法字符导致下载必然失败（已确认缺陷）** - `sanitizeFileName`
   此前只替换 `/` 与 `\\`。标题里的 `| < > : " ? *` 会让 `os.OpenFile` 直接报
@@ -66,9 +68,7 @@ Hanime 视频下载工具，使用 Chrome DevTools Protocol 进行网页抓取�
 - 🧪 **测试** - 新增 12 个用例：文件名清洗表驱动、清洗后路径真实可创建、
   `repairMediaPaths` 修正过期路径、重试 4 例、删除 4 例
 
-## 📦 最新版本：v0.4.7 (2026-10-19)
-
-## 🛠️ v0.4.7 审计整改 (2026-10-19)
+### 历史版本：v0.4.7 (2026-10-19)
 
 针对一次完整的代码审计做了一批修复与工程基线建设。本版本包含以下**破坏性变更**，升级前请留意：
 
@@ -593,9 +593,13 @@ MIT License
 
 ## 🇬🇧 English
 
-### Latest Version: v0.4.7 (2026-10-19)
+### Latest Version: v0.4.8 (2026-11-19)
 
 #### What's New
+- 🛡️ **Security hardening** — path-traversal allowlist for `video_id`/`list_id` (`internal/idutil`), CORS off by default (`apiAllowOrigin` opt-in), optional `apiToken` bearer auth, 1 MiB request body limit, `escapeHtml()` in the web UI, CDP endpoint TLS verified by default (`chromeInsecureTLS` opt-in)
+- 🔁 **Failed-task retry & deletion** — `POST /api/tasks/{id}/retry` re-runs a failed task from scratch; `DELETE /api/tasks/{id}` and `DELETE /api/tasks` clear finished tasks and release their claim so the same video can be re-queued
+- 🖥️ **Windows filename sanitization** — titles containing `| < > : " ? *` no longer make every download fail; illegal characters are folded to fullwidth equivalents and stale cache paths are repaired automatically
+- 🏷️ **Version injection** — `hanime-dl -version` reports the release tag and commit baked in via `-ldflags`
 - 🛡️ **Download integrity** - byte-count validation against `Content-Length`; a truncated `.tmp` is never renamed to the final file
 - 🧪 **Offline test suite** - ~3,000 lines of `httptest` / pure-function tests, plus a `Makefile` and `golangci-lint` baseline
 - ⚠️ **Breaking changes** - `DirectDownloadFirst` removed (it was plumbed through the stack but never read); `config.yaml` is now machine-local and gitignored, ship `config.example.yaml` instead
@@ -740,6 +744,7 @@ Still not implemented — assess before exposing: no rate limiting, no per-user 
 lives in memory (a restart loses it).
 
 #### Releases
+- **v0.4.8** (2026-11-19): Security hardening (Tranche A) + task operations — ID allowlist validation blocking path traversal, same-origin CORS by default with optional `apiToken`, request body limit, stored-XSS escaping in the web UI, CDP TLS verification by default, failed-task claim released for retry, Windows-illegal filename sanitization with cache repair, `POST /api/tasks/{id}/retry` and `DELETE /api/tasks[/{id}]`, `-version` flag with build-time injection, `LICENSE` + CI workflow + `release.sh` hardening
 - **v0.4.7** (2026-10-19): Code-audit remediation — download integrity (byte-count validation, 206
   `Content-Range` start verification), segmented/idle timeouts, per-path download mutex, typed HTTP
   error classification, scraper de-duplication + WARN fallbacks, graceful shutdown, offline unit tests,
